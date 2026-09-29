@@ -19,6 +19,8 @@ import subprocess
 import time
 import zipfile
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
 from datetime import datetime
@@ -43,6 +45,21 @@ from src.orchestrator.cache_manager import CacheManager
 from src.orchestrator.model_selector import ModelSelector
 from src.orchestrator.master_supervisor import MasterSupervisor
 from src.orchestrator.task_router import TaskRouter, TaskType, TaskStatus
+
+# VIO (Aumovio online agents) + environment loading
+from src.vio_client import VIOClient, AGENTS, AGENT_MODELS, TYPE_TO_AGENT
+
+try:
+    from streamlit_agraph import agraph, Node, Edge, Config
+    _AGRAPH = True
+except Exception:
+    _AGRAPH = False
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # load VIO_API_KEY / VIO_API_BASE / OLLAMA_HOST from .env
+except Exception:
+    pass
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -96,6 +113,16 @@ def initialize_state() -> None:
         "orchestration_exec_result": None,  # pytest run result for generated tests
         "dep_install_result": None,  # pip install result for repo dependencies
         "self_correct_result": None,  # self-correction loop summary
+        # --- Dual-mode (VIO / Ollama) UI state ---
+        "mode": None,  # None (gate) | "vio" | "ollama"
+        "theme": "dark",  # "dark" | "light"
+        "vio_endpoint": os.getenv("VIO_API_BASE", "https://vio.automotive-wan.com:446"),
+        "vio_client": None,  # VIOClient instance
+        "vio_connected": False,  # ping result
+        "vio_failures": 0,  # consecutive API failures (for fallback suggestion)
+        "selected_model": None,  # agent/model selected in the branch graph
+        "models": {},  # shared per-model state (status/code/results/tokens/...)
+        "vio_report": None,  # test_generation_master final report
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -950,7 +977,7 @@ def run_pytest_single(repo_path: str, test_filename: str) -> dict:
     cmd = [
         "python", "-m", "pytest", str(scripts_dir / test_filename),
         f"--confcutdir={scripts_dir}", "--rootdir", str(scripts_dir),
-        "-p", "no:cacheprovider", "--tb=short", "-q",
+        "-p", "no:cacheprovider", "--tb=short", "-v",
     ]
     out = ""
     try:
@@ -1634,6 +1661,718 @@ def display_results_section() -> None:
 
 
 
+def aumovio_css(theme: str = "dark") -> str:
+    """Return the Aumovio-branded CSS (orange + deep purple) for the given theme."""
+    if theme == "light":
+        bg, bg2, card = "#FFFFFF", "#F7F4FA", "#FFFFFF"
+        text, text2, border = "#1A0B2E", "#5B5570", "#E5DFEC"
+    else:  # dark (default)
+        bg, bg2, card = "#1A0B2E", "#2E0A4F", "#3A1A5C"
+        text, text2, border = "#F5F3F7", "#C9BFD6", "#4A2A6C"
+    orange, orange_l, purple = "#FF6A13", "#FF8A3D", "#5B2A86"
+    return f"""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
+    :root {{
+        --orange:{orange}; --orange-l:{orange_l}; --purple:{purple};
+        --bg:{bg}; --bg2:{bg2}; --card:{card};
+        --text:{text}; --text2:{text2}; --border:{border};
+    }}
+    .stApp {{ background:{bg}; }}
+    h1,h2,h3,h4 {{ font-family:'Space Grotesk',sans-serif; color:{text} !important; }}
+    p,label,span,li {{ font-family:'DM Sans',sans-serif; }}
+    /* Force readable body text on the themed background */
+    .stApp p, .stApp label, .stApp li,
+    [data-testid="stMarkdownContainer"] p,
+    [data-testid="stMarkdownContainer"] li,
+    [data-testid="stWidgetLabel"] p {{ color:{text} !important; }}
+    .av-muted, .stCaption, [data-testid="stCaptionContainer"] {{ color:{text2} !important; }}
+    /* Gradient top bar */
+    .av-topbar {{
+        display:flex; align-items:center; justify-content:space-between;
+        background:linear-gradient(90deg,{orange} 0%,{purple} 100%);
+        color:#fff; padding:.7rem 1.1rem; border-radius:14px; margin-bottom:1rem;
+        box-shadow:0 10px 30px rgba(0,0,0,.25);
+    }}
+    .av-topbar .brand {{ font-family:'Space Grotesk',sans-serif; font-weight:700; font-size:1.15rem; letter-spacing:.02em; }}
+    .av-topbar .brand small {{ opacity:.85; font-weight:500; }}
+    /* Cards */
+    .av-card {{ background:{card}; border:1px solid {border}; border-radius:14px; padding:1rem 1.25rem; margin:.4rem 0; }}
+    .av-card h4 {{ margin:0 0 .3rem; }}
+    .av-muted {{ color:{text2}; font-size:.85rem; }}
+    /* Mode gate cards */
+    .av-gate {{ background:{card}; border:1px solid {border}; border-radius:18px; padding:1.6rem; text-align:center; }}
+    .av-gate .ico {{ font-size:2.4rem; }}
+    .av-gate h3 {{ margin:.4rem 0 .2rem; }}
+    /* Status dot */
+    .av-dot {{ height:11px; width:11px; border-radius:50%; display:inline-block; margin-right:7px; vertical-align:middle; }}
+    .av-badge {{ display:inline-block; padding:.15rem .6rem; border-radius:999px; font-size:.72rem; font-weight:700; letter-spacing:.04em; }}
+    /* Buttons -> Aumovio orange */
+    .stButton > button {{ background:{orange}; color:#fff; border:0; border-radius:10px; font-weight:700; }}
+    .stButton > button:hover {{ background:{orange_l}; color:#fff; }}
+    [data-testid='stSidebar'] {{ background:{bg2} !important; }}
+    [data-testid='stSidebar'] * {{ color:{text} !important; }}
+    .stMarkdown code {{ background:{bg2}; color:{orange_l}; padding:2px 6px; border-radius:4px; border:1px solid {border}; }}
+    </style>
+    """
+
+
+def render_top_bar() -> None:
+    """Persistent gradient top bar: brand, mode badge, theme toggle, change mode."""
+    mode = st.session_state.get("mode")
+    mode_label = "🌐 VIO Agents (Online)" if mode == "vio" else "🖥️ Ollama (Offline)"
+    st.markdown(
+        f"""
+        <div class="av-topbar">
+            <div class="brand">AUMOVIO &nbsp;·&nbsp; Enterprise Test Generator
+                <small>&nbsp;| {mode_label}</small></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    c1, c2, _ = st.columns([1, 1, 6])
+    with c1:
+        if st.button("⟵ Change mode", use_container_width=True):
+            st.session_state["mode"] = None
+            st.rerun()
+    with c2:
+        cur = st.session_state.get("theme", "dark")
+        label = "☀️ Light" if cur == "dark" else "🌙 Dark"
+        if st.button(label, use_container_width=True):
+            st.session_state["theme"] = "light" if cur == "dark" else "dark"
+            st.rerun()
+
+
+def render_mode_gate() -> None:
+    """Landing gate: choose VIO (online) or Ollama (offline)."""
+    st.markdown(
+        """
+        <div style="text-align:center; margin:2rem 0 1rem;">
+            <div style="font-family:'Space Grotesk',sans-serif; font-weight:700;
+                        font-size:2rem; background:linear-gradient(90deg,#FF6A13,#5B2A86);
+                        -webkit-background-clip:text; -webkit-text-fill-color:transparent;">
+                AUMOVIO Enterprise Test Generator
+            </div>
+            <div class="av-muted">Choose how you want to generate tests</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown(
+            '<div class="av-gate"><div class="ico">🌐</div>'
+            '<h3>VIO Agents (Online)</h3>'
+            '<div class="av-muted">5 cloud agents · fast (5–15s/test) · needs network</div></div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("Use VIO Agents", key="gate_vio", use_container_width=True):
+            st.session_state["mode"] = "vio"
+            st.rerun()
+    with col2:
+        st.markdown(
+            '<div class="av-gate"><div class="ico">🖥️</div>'
+            '<h3>Ollama (Offline)</h3>'
+            '<div class="av-muted">3 local models · private · slower (CPU) · offline backup</div></div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("Use Ollama (Local)", key="gate_ollama", use_container_width=True):
+            st.session_state["mode"] = "ollama"
+            st.rerun()
+
+
+STATUS_COLORS = {
+    "idle": "#9CA3AF",
+    "queued": "#5B2A86",
+    "generating": "#FF8A3D",
+    "validating": "#8B5CF6",
+    "testing": "#FF6A13",
+    "fixing": "#14B8A6",
+    "done": "#22C55E",
+    "error": "#EF4444",
+}
+
+# Cross-thread progress store for live branch-graph updates. Written by the
+# background VIO worker thread, read by the auto-refreshing UI fragment.
+VIO_LIVE = {"progress": {}, "results": {}, "done": True, "running": False}
+
+
+def _branch_diagram_html(models_state: dict) -> str:
+    """Build the fixed branch-diagram (+legend) HTML from a models-state dict."""
+    def _status(agent: str) -> str:
+        return models_state.get(agent, {}).get("status", "idle")
+
+    def _color(agent: str) -> str:
+        return STATUS_COLORS.get(_status(agent), "#9CA3AF")
+
+    def _substat(agent: str) -> str:
+        d = models_state.get(agent, {})
+        stt = d.get("status", "idle").upper()
+        if "passed" in d:
+            return f"{stt} · {d.get('passed',0)}✓ {d.get('failed',0)}✗ {d.get('errors',0)}⚠"
+        return stt
+
+    master = AGENTS["master"]
+    workers = [AGENTS[k] for k in ("unit", "integration", "e2e", "security")]
+    worker_labels = ["unit", "integration", "e2e", "security"]
+    worker_centers = [95, 285, 475, 665]
+
+    lines = "".join(
+        f'<line x1="380" y1="86" x2="{cx}" y2="212" stroke="#FF8A3D" stroke-width="2.5" />'
+        for cx in worker_centers
+    )
+    master_box = (
+        f'<div style="position:absolute; left:280px; top:20px; width:200px; '
+        f'text-align:center; padding:.6rem .4rem; border-radius:12px; '
+        f'background:{_color(master)}; color:#fff; font-weight:700; '
+        f'box-shadow:0 6px 18px rgba(0,0,0,.35);">🧠 test_generation_master'
+        f'<div style="font-size:.72rem; font-weight:500; opacity:.9;">'
+        f'{AGENT_MODELS.get(master,"")}</div>'
+        f'<div style="font-size:.66rem; font-weight:700; margin-top:.15rem; '
+        f'letter-spacing:.03em;">{_substat(master)}</div></div>'
+    )
+    worker_boxes = ""
+    for label, w, cx in zip(worker_labels, workers, worker_centers):
+        worker_boxes += (
+            f'<div style="position:absolute; left:{cx-75}px; top:212px; width:150px; '
+            f'text-align:center; padding:.5rem .3rem; border-radius:12px; '
+            f'background:{_color(w)}; color:#fff; font-weight:700; font-size:.85rem; '
+            f'box-shadow:0 6px 16px rgba(0,0,0,.3);">{label}'
+            f'<div style="font-size:.68rem; font-weight:500; opacity:.9;">'
+            f'{AGENT_MODELS.get(w,"")}</div>'
+            f'<div style="font-size:.64rem; font-weight:700; margin-top:.15rem;">'
+            f'{_substat(w)}</div></div>'
+        )
+    legend = "".join(
+        f'<span style="margin-right:.9rem; white-space:nowrap;">'
+        f'<span class="av-dot" style="background:{c}"></span>{name}</span>'
+        for name, c in [
+            ("idle", STATUS_COLORS["idle"]), ("generating", STATUS_COLORS["generating"]),
+            ("validating", STATUS_COLORS["validating"]), ("testing", STATUS_COLORS["testing"]),
+            ("fixing", STATUS_COLORS["fixing"]), ("done", STATUS_COLORS["done"]),
+            ("error", STATUS_COLORS["error"]),
+        ]
+    )
+    return (
+        f'<div style="position:relative; width:760px; height:300px; margin:0 auto;">'
+        f'<svg width="760" height="300" style="position:absolute; top:0; left:0;">{lines}</svg>'
+        f'{master_box}{worker_boxes}</div>'
+        f'<div class="av-muted" style="text-align:center;">{legend}</div>'
+    )
+
+
+def render_branch_controls() -> None:
+    """Render the row of selection buttons under the branch diagram."""
+    master = AGENTS["master"]
+    workers = [AGENTS[k] for k in ("unit", "integration", "e2e", "security")]
+    worker_labels = ["unit", "integration", "e2e", "security"]
+    st.caption("Select an agent to view its details:")
+    bcols = st.columns(5)
+    for col, (name, agent) in zip(
+        bcols, [("🧠 master", master)] + list(zip(worker_labels, workers))
+    ):
+        with col:
+            if st.button(name, key=f"sel_{agent}", use_container_width=True):
+                st.session_state["selected_model"] = agent
+
+
+def render_branch_graph() -> None:
+    """Static branch view: diagram (from session models) + selection buttons."""
+    st.markdown(
+        _branch_diagram_html(st.session_state.get("models", {})),
+        unsafe_allow_html=True,
+    )
+    render_branch_controls()
+
+
+def render_model_detail() -> None:
+    """Clean, README-style master-detail panel for the selected agent."""
+    agent = st.session_state.get("selected_model")
+    if not agent:
+        st.caption("👆 Click an agent node above to see its details.")
+        return
+
+    data = st.session_state.get("models", {}).get(agent, {})
+    status = data.get("status", "idle")
+    color = STATUS_COLORS.get(status, "#9CA3AF")
+    is_master = agent == AGENTS["master"]
+
+    # Header card
+    st.markdown(
+        f'<div class="av-card"><h4>{"🧠 " if is_master else ""}{agent} '
+        f'<span class="av-badge" style="background:{color};color:#fff">{status.upper()}</span></h4>'
+        f'<div class="av-muted">{AGENT_MODELS.get(agent, "")} · '
+        f'{data.get("tokens", 0)} tokens</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    if not data:
+        st.caption("No run data yet. Run a generation to populate this agent.")
+        return
+
+    # ── Master (supervisor) view ──
+    if is_master:
+        st.markdown("##### 🧠 What the master did")
+        st.markdown(
+            "- **Validated** every worker's generated tests (quality gate: GOLD / SILVER / BRONZE)\n"
+            "- **Diagnosed** failures and guided auto-fixes\n"
+            "- **Wrote** the consolidated final report"
+        )
+        vals = data.get("validations", [])
+        if vals:
+            st.markdown("##### ✅ Validation verdicts")
+            for v in vals:
+                emoji = {"GOLD": "🥇", "SILVER": "🥈", "BRONZE": "🥉"}.get(v["level"], "•")
+                st.markdown(f"{emoji} **{v['agent']}** — {v['level']}")
+                if v.get("reasons"):
+                    st.caption(f"↳ {v['reasons']}")
+        if data.get("report"):
+            st.markdown("##### 📝 Final report")
+            st.markdown(data["report"])
+        return
+
+    # ── Worker (README-style) view ──
+    task = data.get("task_type", "—")
+    passed = data.get("passed", 0)
+    failed = data.get("failed", 0)
+    errors = data.get("errors", 0)
+
+    st.markdown("##### 📋 What we did")
+    st.write(
+        f"Generated **{task.replace('_',' ')}** for this repository using "
+        f"**{AGENT_MODELS.get(agent, agent)}**, then validated and executed them."
+    )
+
+    st.markdown("##### ⚙️ How we did it")
+    st.markdown(
+        "1. Read the **real repository source** (grounding — no guessing)\n"
+        "2. Extracted the **actual importable symbols** so imports are valid\n"
+        "3. **Generated** pytest tests with this agent\n"
+        "4. **Validated** them with `test_generation_master`\n"
+        "5. **Executed** with pytest; auto-fixed failures when needed"
+    )
+
+    v = data.get("validation", {})
+    if v:
+        emoji = {"GOLD": "🥇", "SILVER": "🥈", "BRONZE": "🥉"}.get(v.get("level"), "•")
+        st.markdown(f"##### {emoji} Quality verdict: **{v.get('level','?')}**")
+        if v.get("reasons"):
+            st.caption(v["reasons"])
+
+    st.markdown("##### 🎯 Result")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Passed", passed)
+    m2.metric("Failed", failed)
+    m3.metric("Errors", errors)
+
+    results = data.get("results", [])
+    if results:
+        for t in results:
+            icon = {"PASSED": "✅", "FAILED": "❌", "ERROR": "🟠"}.get(t["status"], "•")
+            st.markdown(f"{icon} `{t['name']}`")
+            if t.get("reason"):
+                st.caption(f"↳ {t['reason']}")
+    else:
+        st.caption("No per-test breakdown available.")
+
+    code = data.get("code", "")
+    if code:
+        with st.expander("📄 View the generated test code", expanded=False):
+            st.code(code, language="python")
+            st.download_button(
+                "⬇️ Download",
+                data=code,
+                file_name=f"{task}_test.py",
+                mime="text/x-python",
+                key=f"dl_{agent}",
+            )
+
+
+
+def _write_vio_conftest(repo_path: str) -> None:
+    """Write a conftest so pytest can import the repo package from source."""
+    scripts_dir = Path(repo_path) / "tests" / "test_scripts"
+    if not scripts_dir.exists():
+        return
+    try:
+        import_root, package = discover_package_import_root(Path(repo_path))
+        (scripts_dir / "conftest.py").write_text(
+            "import sys\n"
+            f"sys.path.insert(0, r\"{import_root}\")\n"
+            f"sys.path.insert(0, r\"{Path(repo_path)}\")\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _vio_process_task(client, repo_path, source_context, task_type, status_cb=None) -> tuple:
+    """Thread-safe worker: generate → validate → pytest → fix for one task.
+
+    Contains NO Streamlit calls so it can run inside a thread pool.
+    status_cb(str) is an optional callback to report live step status.
+    Returns (agent, result_dict).
+    """
+    def _report(s):
+        if status_cb:
+            try:
+                status_cb(s)
+            except Exception:
+                pass
+
+    agent = TYPE_TO_AGENT.get(task_type, AGENTS["unit"])
+    task_id = f"{task_type}_0"
+    result = {"status": "generating", "task_type": task_type, "tokens": 0, "time_s": 0.0}
+
+    _report("generating")
+    prompt = create_task_prompt(task_type, repo_path)
+    res = client.generate_test(agent, prompt)
+    if not res["ok"]:
+        result.update(status="error", validation={"level": "-", "reasons": res["error"]})
+        _report("error")
+        return agent, result
+
+    code = extract_python_code(res["content"])
+    elapsed = res["time_s"]
+    save_orchestration_result(repo_path, task_id, res["content"])
+
+    _report("validating")
+    verdict = client.validate(code, source_context)
+
+    _report("testing")
+    pyres = run_pytest_single(repo_path, f"{task_id}_test.py")
+
+    # One fix round if needed
+    if pyres["failed"] + pyres["errors"] > 0:
+        _report("fixing")
+        fix = client.fix_test(code, pyres["output"], source_context)
+        if fix["ok"]:
+            fixed = extract_python_code(fix["content"])
+            if fixed and "def test" in fixed:
+                scripts_dir = Path(repo_path) / "tests" / "test_scripts"
+                (scripts_dir / f"{task_id}_test.py").write_text(
+                    "# VIO auto-fixed\n" + fixed + "\n", encoding="utf-8")
+                code = fixed
+                pyres = run_pytest_single(repo_path, f"{task_id}_test.py")
+                elapsed += fix["time_s"]
+
+    results = parse_pytest_output(pyres["output"])
+    all_pass = pyres["passed"] > 0 and pyres["failed"] + pyres["errors"] == 0
+    final_status = "done" if all_pass else ("error" if pyres["passed"] == 0 else "done")
+    result.update(
+        status=final_status,
+        code=code, validation=verdict, results=results,
+        tokens=client.token_usage.get(agent, 0), time_s=elapsed,
+        passed=pyres["passed"], failed=pyres["failed"], errors=pyres["errors"],
+    )
+    _report(final_status)
+    return agent, result
+
+
+def _vio_background_run(client, repo_path, source_context, selected_types, parallel) -> None:
+    """Run the VIO pipeline in a background thread, updating VIO_LIVE live."""
+    def work(tt):
+        agent = TYPE_TO_AGENT.get(tt, AGENTS["unit"])
+        try:
+            a, result = _vio_process_task(
+                client, repo_path, source_context, tt,
+                status_cb=lambda s: VIO_LIVE["progress"].__setitem__(agent, s),
+            )
+            VIO_LIVE["results"][a] = result
+            VIO_LIVE["progress"][a] = result.get("status", "done")
+        except Exception as exc:  # pragma: no cover - defensive
+            VIO_LIVE["progress"][agent] = "error"
+            VIO_LIVE["results"][agent] = {
+                "status": "error", "task_type": tt,
+                "validation": {"level": "-", "reasons": str(exc)},
+            }
+
+    try:
+        if parallel and len(selected_types) > 1:
+            with ThreadPoolExecutor(max_workers=min(4, len(selected_types))) as ex:
+                list(ex.map(work, selected_types))
+        else:
+            for tt in selected_types:
+                work(tt)
+    finally:
+        VIO_LIVE["done"] = True
+
+
+
+def run_vio_orchestration(selected_types: list, parallel: bool = True, graph_ph=None) -> None:
+    """Generate + validate + run + fix tests using the VIO agents.
+
+    Redraws the branch diagram into `graph_ph` (an st.empty) after every status
+    change so the graph updates LIVE on the main thread (no background threads).
+    Sequential mode shows every step (generate→validate→test→fix); parallel mode
+    lights up each agent as it completes.
+    """
+    client = st.session_state.get("vio_client")
+    repo_path = st.session_state.get("repository_path")
+    if not client:
+        st.error("Connect to VIO first.")
+        return
+    if not repo_path:
+        st.error("Clone a repository first (enter a URL and generate).")
+        return
+
+    # Clear stale artifacts from previous runs.
+    for sub in ("test_scripts", "orchestration_results"):
+        d = Path(repo_path) / "tests" / sub
+        if d.exists():
+            for f in d.glob("*"):
+                try:
+                    if f.is_file():
+                        f.unlink()
+                except Exception:
+                    pass
+
+    source_context, _ = gather_source_context(repo_path, max_chars=8000)
+    scripts_dir = Path(repo_path) / "tests" / "test_scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    _write_vio_conftest(repo_path)
+
+    # Live model state used only for redrawing the graph during the run.
+    live = {
+        TYPE_TO_AGENT.get(tt, AGENTS["unit"]): {"status": "queued", "task_type": tt}
+        for tt in selected_types
+    }
+
+    def redraw():
+        if graph_ph is not None:
+            graph_ph.markdown(_branch_diagram_html(live), unsafe_allow_html=True)
+
+    redraw()
+
+    if parallel and len(selected_types) > 1:
+        # Workers report sub-step status into a shared dict; the main thread
+        # polls it and redraws so all agents visibly progress concurrently.
+        shared = {}
+
+        def _make_cb(agent):
+            return lambda s: shared.__setitem__(agent, s)
+
+        with ThreadPoolExecutor(max_workers=min(4, len(selected_types))) as ex:
+            futures = {}
+            for tt in selected_types:
+                agent = TYPE_TO_AGENT.get(tt, AGENTS["unit"])
+                shared[agent] = "generating"
+                live[agent]["status"] = "generating"
+                futures[ex.submit(
+                    _vio_process_task, client, repo_path, source_context, tt, _make_cb(agent)
+                )] = agent
+            redraw()
+
+            # Poll while all workers run concurrently.
+            while not all(f.done() for f in futures):
+                for agent, s in list(shared.items()):
+                    if agent in live and "passed" not in live[agent]:
+                        live[agent]["status"] = s
+                redraw()
+                time.sleep(0.4)
+
+            # Collect final results.
+            for fut, agent in futures.items():
+                try:
+                    a, result = fut.result()
+                    live[a] = result
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.error(f"VIO task failed: {exc}")
+            redraw()
+    else:
+        for tt in selected_types:
+            agent = TYPE_TO_AGENT.get(tt, AGENTS["unit"])
+
+            def _cb(s, a=agent):
+                live[a]["status"] = s
+                redraw()
+
+            a, result = _vio_process_task(client, repo_path, source_context, tt, status_cb=_cb)
+            live[a] = result
+            redraw()
+
+    # Final report from test_generation_master
+    report_text = ""
+    try:
+        summary_lines = []
+        for agent, d in live.items():
+            if "passed" in d:
+                summary_lines.append(
+                    f"- {agent} ({d.get('task_type','')}): "
+                    f"{d.get('passed',0)} passed, {d.get('failed',0)} failed, "
+                    f"{d.get('errors',0)} errors; validation={d.get('validation',{}).get('level','?')}"
+                )
+        if summary_lines:
+            rep = client.report("Repository: " + str(repo_path) + "\n" + "\n".join(summary_lines))
+            if rep.get("ok"):
+                report_text = rep["content"]
+                st.session_state["vio_report"] = report_text
+    except Exception:
+        pass
+
+    # Populate the master's own detail panel (its supervisory work).
+    master_agent = AGENTS["master"]
+    validations = [
+        {
+            "agent": a,
+            "level": d.get("validation", {}).get("level", "?"),
+            "reasons": d.get("validation", {}).get("reasons", ""),
+        }
+        for a, d in live.items() if d.get("validation")
+    ]
+    live[master_agent] = {
+        "status": "done",
+        "task_type": "supervision",
+        "tokens": client.token_usage.get(master_agent, 0),
+        "validations": validations,
+        "report": report_text,
+        "repo": str(repo_path),
+    }
+
+    st.session_state["models"] = live
+    st.success("VIO generation complete! Click a branch to inspect each agent.")
+
+
+def _start_vio_run(client, repo_path: str, selected_types: list, parallel: bool) -> None:
+    """Deprecated: superseded by the synchronous placeholder-redraw approach."""
+    return
+
+
+def render_vio_workspace() -> None:
+    """VIO mode shell: endpoint input, connect/ping, connection status, agents."""
+    st.markdown("### 🌐 VIO Agents")
+
+    col_ep, col_btn = st.columns([4, 1])
+    with col_ep:
+        endpoint = st.text_input(
+            "VIO Endpoint",
+            value=st.session_state.get("vio_endpoint", ""),
+            help="Base URL. Requests go to {base}/chat/completions",
+        )
+        st.session_state["vio_endpoint"] = endpoint
+    with col_btn:
+        st.write("")
+        st.write("")
+        connect = st.button("🔌 Connect", use_container_width=True)
+
+    if connect:
+        with st.spinner("Pinging VIO..."):
+            client = VIOClient(base_url=endpoint)
+            if not client.is_configured:
+                st.session_state["vio_connected"] = False
+                st.error("VIO_API_KEY missing. Add it to your .env file, then reconnect.")
+            else:
+                ok = client.ping()
+                st.session_state["vio_client"] = client
+                st.session_state["vio_connected"] = ok
+                st.session_state["vio_failures"] = 0 if ok else st.session_state.get("vio_failures", 0) + 1
+
+    # Connection status dot
+    connected = st.session_state.get("vio_connected", False)
+    dot = "#22C55E" if connected else "#EF4444"
+    label = "Connected" if connected else "Not connected"
+    st.markdown(
+        f'<span class="av-dot" style="background:{dot}"></span>'
+        f'<b>{label}</b> &nbsp;<span class="av-muted">{endpoint}</span>',
+        unsafe_allow_html=True,
+    )
+
+    if not connected and st.session_state.get("vio_failures", 0) >= 3:
+        st.warning("VIO failed 3+ times. Consider switching to Ollama (offline) mode.")
+
+    # Interactive agent branch graph (master → workers). The diagram lives in a
+    # placeholder so it can be redrawn live during a run; buttons stay separate.
+    st.markdown("#### Agent Branches")
+    st.caption("Click any agent node to see its task, generated tests, and results.")
+    graph_ph = st.empty()
+    graph_ph.markdown(
+        _branch_diagram_html(st.session_state.get("models", {})),
+        unsafe_allow_html=True,
+    )
+    render_branch_controls()
+
+    # Master-detail panel for the selected agent
+    render_model_detail()
+
+    # ── Generation controls ──
+    st.markdown("---")
+    st.markdown("#### Generate Tests")
+    repo_url = st.text_input(
+        "GitHub Repository URL",
+        key="vio_repo_url",
+        placeholder="https://github.com/owner/repository",
+    )
+
+    type_map = {
+        "🧪 Unit": "unit_test",
+        "🔗 Integration": "integration_test",
+        "🌐 E2E": "e2e_test",
+        "🔐 Security": "security",
+    }
+    st.caption("Select test types (each routes to its specialized agent):")
+    tcols = st.columns(len(type_map))
+    selected_types = []
+    for col, (label, ttype) in zip(tcols, type_map.items()):
+        with col:
+            if st.checkbox(label, key=f"vio_type_{ttype}"):
+                selected_types.append(ttype)
+
+    parallel = st.checkbox(
+        "⚡ Run agents in parallel", value=True, key="vio_parallel",
+        help="Run all selected test types concurrently (much faster for VIO).",
+    )
+
+    run_col, dep_col = st.columns([1, 1])
+    with run_col:
+        run = st.button("▶️ Generate with VIO Agents", use_container_width=True,
+                        disabled=not connected)
+    with dep_col:
+        if st.button("📦 Install Repo Dependencies", use_container_width=True,
+                     key="vio_install_deps"):
+            if st.session_state.get("repository_path"):
+                with st.spinner("Installing repo dependencies..."):
+                    st.session_state["dep_install_result"] = install_repo_dependencies(
+                        st.session_state["repository_path"])
+            else:
+                st.warning("Clone a repo first (enter URL and click Generate).")
+
+    dep_result = st.session_state.get("dep_install_result")
+    if dep_result:
+        (st.success if dep_result.get("success") else st.warning)(
+            dep_result.get("message", ""))
+
+    if run:
+        if not selected_types:
+            st.warning("Select at least one test type.")
+        elif not repo_url:
+            st.warning("Enter a GitHub repository URL.")
+        else:
+            generate_repository_prompt(repo_url)  # clone + set repository_path
+            if st.session_state.get("repository_path"):
+                run_vio_orchestration(selected_types, parallel=parallel, graph_ph=graph_ph)
+                st.rerun()  # refresh scorecard/detail with final state
+
+    # ── Aggregate scorecard ──
+    models = st.session_state.get("models", {})
+    ran = [m for m in models.values() if m.get("results") is not None or "passed" in m]
+    if ran:
+        total_p = sum(m.get("passed", 0) for m in ran)
+        total_f = sum(m.get("failed", 0) for m in ran)
+        total_e = sum(m.get("errors", 0) for m in ran)
+        total_tok = sum(m.get("tokens", 0) for m in ran)
+        st.markdown("#### Results")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Passed", total_p)
+        s2.metric("Failed", total_f)
+        s3.metric("Errors", total_e)
+        s4.metric("Tokens", total_tok)
+
+        report = st.session_state.get("vio_report")
+        if report:
+            with st.expander("📝 Final report (by test_generation_master)", expanded=False):
+                st.markdown(report)
+
+
 def main() -> None:
     """
     Main application entry point.
@@ -1652,49 +2391,27 @@ def main() -> None:
         initial_sidebar_state="expanded",
     )
     
-    # Initialize session state and UI
+    # Initialize session state
     initialize_state()
-    render_sidebar()
 
-    # Apply custom CSS styling
-    st.markdown(
-        """
-        <style>
-        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
-        :root { 
-            --primary: #087f8c;
-            --primary-dark: #056b7a;
-            --bg-dark: #0e1117;
-            --bg-secondary: #161b22;
-            --text-primary: #c9d1d9;
-            --text-secondary: #8b949e;
-            --border: #30363d;
-        }
-        h1, h2, h3 { font-family: 'Space Grotesk', sans-serif; color: var(--text-primary); }
-        p, label, div { font-family: 'DM Sans', sans-serif; }
-        .hero { max-width: 900px; margin: 1.5rem auto 1rem; text-align: center; }
-        .eyebrow { color: var(--primary); font-size: .75rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
-        .hero h1 { font-size: clamp(2rem, 5vw, 3.7rem); margin: .35rem 0 .4rem; letter-spacing: 0; }
-        .hero p { color: var(--text-secondary); font-size: 1.08rem; margin: 0; }
-        .input-shell { max-width: 840px; margin: 2rem auto 0; padding: 1.35rem 1.5rem .8rem; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 14px 38px rgba(0, 0, 0, .3); }
-        .status-card { min-height: 88px; display: flex; align-items: center; gap: .8rem; padding: 1rem; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 12px; }
-        .status-icon { font-size: 1.35rem; }
-        .status-label { color: var(--text-secondary); font-size: .76rem; text-transform: uppercase; letter-spacing: .08em; }
-        .status-value { color: var(--text-primary); font-size: .96rem; font-weight: 600; margin-top: .25rem; word-break: break-word; }
-        .workflow-step { display: flex; align-items: center; gap: .7rem; min-height: 42px; padding: .35rem .15rem; color: var(--text-primary); font-size: .9rem; }
-        .workflow-number { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; flex: 0 0 28px; border: 1px solid var(--primary); border-radius: 50%; color: var(--primary); font-size: .72rem; font-weight: 700; }
-        .prompt-header { display: flex; justify-content: space-between; align-items: end; margin: 1.8rem 0 .55rem; }
-        .prompt-header h2 { margin: 0; }
-        [data-testid='stSidebar'] { background: #0d1b1f !important; }
-        [data-testid='stSidebar'] * { color: var(--text-primary) !important; }
-        [data-testid='stSidebar'] .stCaption { color: var(--text-secondary) !important; }
-        .stButton > button { background: var(--primary); color: white; border: 0; border-radius: 8px; font-weight: 700; }
-        .stButton > button:hover { background: var(--primary-dark); color: white; }
-        .stMarkdown code { background: var(--bg-secondary); color: var(--text-primary); padding: 2px 6px; border-radius: 4px; border: 1px solid var(--border); }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    # Apply Aumovio theme (orange + deep purple; dark default, light toggle)
+    st.markdown(aumovio_css(st.session_state.get("theme", "dark")), unsafe_allow_html=True)
+
+    # Mode gate — pick VIO or Ollama before showing any workspace
+    if st.session_state.get("mode") is None:
+        render_mode_gate()
+        return
+
+    # Persistent top bar (brand, mode badge, theme toggle, change mode)
+    render_top_bar()
+
+    # VIO workspace returns early; Ollama continues with the existing flow below
+    if st.session_state.get("mode") == "vio":
+        render_vio_workspace()
+        return
+
+    # ── Ollama workspace (existing flow, unchanged) ──
+    render_sidebar()
 
     # Header and introduction
     st.markdown("## 🧪 Enterprise Test Generator")
