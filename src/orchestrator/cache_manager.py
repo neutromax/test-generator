@@ -237,6 +237,32 @@ class CacheManager:
                 
                 # Check status
                 if status == self.STATUS_DONE:
+                    # A cache row is not usable when its generated artifact was
+                    # deleted or moved. Treat it as stale so the Ollama path
+                    # regenerates the missing output instead of reporting a
+                    # false cache hit with no runnable test file.
+                    output_file = Path(output_path) if output_path else None
+                    script_file = (
+                        output_file.parent.parent / "test_scripts" / f"{test_type}_0_test.py"
+                        if output_file
+                        else None
+                    )
+                    if (
+                        output_file is None
+                        or not output_file.exists()
+                        or script_file is None
+                        or not script_file.exists()
+                    ):
+                        logger.debug(
+                            f"Cache INVALID for {test_type}: generated output or script missing"
+                        )
+                        self.mark_invalid(
+                            repo_hash,
+                            test_type,
+                            "Cached generated output or runnable script missing",
+                        )
+                        return False
+
                     # Verify file hashes match
                     try:
                         stored_hashes = json.loads(stored_hashes_json or "{}")

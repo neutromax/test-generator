@@ -328,7 +328,12 @@ def run_test_orchestration(selected_types: List[str]) -> None:
     5. Cache results
     6. Display progress and results
     """
-    task_router = st.session_state["task_router"]
+    # Each run gets a fresh queue so prior tasks cannot be reprocessed or shown
+    # as current results after the user changes the selected test types.
+    task_router = TaskRouter()
+    st.session_state["task_router"] = task_router
+    st.session_state["execution_results"] = {}
+    st.session_state["show_queue_status"] = False
     model_selector = st.session_state["model_selector"]
     master_supervisor = st.session_state["master_supervisor"]
     cache_manager = st.session_state["cache_manager"]
@@ -383,7 +388,12 @@ def run_test_orchestration(selected_types: List[str]) -> None:
                     cached_path = cache_manager.get_cached_result(repo_hash, task_type_str)
                     st.write(f"  ✅ {task_id}: Using cached result")
                     task_router.mark_task_skipped(task_id, "Cached")
-                    batch_results[task_id] = {"status": "SKIPPED", "path": cached_path}
+                    batch_results[task_id] = {
+                        "status": "SKIPPED",
+                        "path": cached_path,
+                        "model": "cache",
+                        "validation_level": "cached",
+                    }
                     continue
                 
                 # Mark in progress
@@ -393,7 +403,16 @@ def run_test_orchestration(selected_types: List[str]) -> None:
                 model = model_selector.select_model(task_type_str)
                 if not model:
                     st.error(f"  ❌ {task_id}: No available model")
-                    task_router.mark_task_failed(task_id, "No available model")
+                    error_msg = (
+                        f"No installed Ollama model matches the routing for {task_type_str}. "
+                        "Install one of the configured fallback models and retry."
+                    )
+                    task_router.mark_task_failed(task_id, error_msg)
+                    batch_results[task_id] = {
+                        "status": "FAILED",
+                        "error": error_msg,
+                        "model": "none",
+                    }
                     continue
                 
                 # Generate test
@@ -431,7 +450,14 @@ def run_test_orchestration(selected_types: List[str]) -> None:
                         
                         st.write(f"  ✅ {task_id}: Generated ({duration_ms:.0f}ms)")
                         task_router.mark_task_complete(task_id, result_path)
-                        batch_results[task_id] = {"status": "COMPLETED", "path": result_path}
+                        batch_results[task_id] = {
+                            "status": "COMPLETED",
+                            "path": result_path,
+                            "model": model,
+                            "duration_ms": duration_ms,
+                            "validation_level": validation_result.level.value,
+                            "prompt": prompt,
+                        }
                     
                     elif validation_result.needs_correction:
                         # Apply correction
@@ -440,6 +466,26 @@ def run_test_orchestration(selected_types: List[str]) -> None:
                         corrected_output, _ = ollama_client.generate(
                             model, validation_result.correction_prompt
                         )
+
+                        corrected_validation = master_supervisor.validate_worker_output(
+                            task_type_str, corrected_output, model
+                        )
+                        if not corrected_validation.is_approved:
+                            error_msg = (
+                                f"Correction remained {corrected_validation.level.value}: "
+                                f"{corrected_validation.error_message or 'quality checks still failed'}"
+                            )
+                            st.error(f"  ❌ {task_id}: {error_msg}")
+                            cache_manager.mark_failed(repo_hash, task_type_str, error_msg)
+                            task_router.mark_task_failed(task_id, error_msg)
+                            batch_results[task_id] = {
+                                "status": "FAILED",
+                                "error": error_msg,
+                                "model": model,
+                                "validation_level": corrected_validation.level.value,
+                                "prompt": validation_result.correction_prompt,
+                            }
+                            continue
                         
                         result_path = save_orchestration_result(
                             repo_path, task_id, corrected_output
@@ -451,7 +497,14 @@ def run_test_orchestration(selected_types: List[str]) -> None:
                         
                         st.write(f"  ✅ {task_id}: Corrected and saved")
                         task_router.mark_task_complete(task_id, result_path)
-                        batch_results[task_id] = {"status": "COMPLETED", "path": result_path}
+                        batch_results[task_id] = {
+                            "status": "COMPLETED",
+                            "path": result_path,
+                            "model": model,
+                            "duration_ms": duration_ms,
+                            "validation_level": corrected_validation.level.value,
+                            "prompt": validation_result.correction_prompt,
+                        }
                     
                     else:
                         # Failed validation
@@ -459,14 +512,25 @@ def run_test_orchestration(selected_types: List[str]) -> None:
                         st.error(f"  ❌ {task_id}: {error_msg}")
                         cache_manager.mark_failed(repo_hash, task_type_str, error_msg)
                         task_router.mark_task_failed(task_id, error_msg)
-                        batch_results[task_id] = {"status": "FAILED", "error": error_msg}
+                        batch_results[task_id] = {
+                            "status": "FAILED",
+                            "error": error_msg,
+                            "model": model,
+                            "validation_level": validation_result.level.value,
+                            "prompt": prompt,
+                        }
                 
                 except Exception as e:
                     error_msg = f"Execution error: {str(e)}"
                     st.error(f"  ❌ {task_id}: {error_msg}")
                     cache_manager.mark_failed(repo_hash, task_type_str, error_msg)
                     task_router.mark_task_failed(task_id, error_msg)
-                    batch_results[task_id] = {"status": "FAILED", "error": error_msg}
+                    batch_results[task_id] = {
+                        "status": "FAILED",
+                        "error": error_msg,
+                        "model": model,
+                        "prompt": prompt,
+                    }
             
             execution_results.update(batch_results)
         
@@ -804,6 +868,15 @@ def display_orchestration_results() -> None:
         if result["status"] == "COMPLETED":
             path = result.get("path", "")
             st.success(f"✅ {task_id}: Generated successfully")
+            meta = []
+            if result.get("model"):
+                meta.append(f"Model: `{result['model']}`")
+            if result.get("duration_ms") is not None:
+                meta.append(f"Duration: {result['duration_ms'] / 1000:.1f}s")
+            if result.get("validation_level"):
+                meta.append(f"Validation: **{result['validation_level']}**")
+            if meta:
+                st.caption(" · ".join(meta))
             content = ""
             if path and Path(path).exists():
                 try:
@@ -821,8 +894,21 @@ def display_orchestration_results() -> None:
                         mime="text/markdown",
                         key=f"download_{task_id}",
                     )
+                    if result.get("prompt"):
+                        with st.expander(f"🧾 View Ollama prompt — {task_id}", expanded=False):
+                            st.code(result["prompt"], language="text")
         elif result["status"] == "FAILED":
             st.error(f"❌ {task_id}: {result.get('error', 'Unknown error')}")
+            failure_meta = []
+            if result.get("model"):
+                failure_meta.append(f"Model: `{result['model']}`")
+            if result.get("validation_level"):
+                failure_meta.append(f"Validation: **{result['validation_level']}**")
+            if failure_meta:
+                st.caption(" · ".join(failure_meta))
+            if result.get("prompt"):
+                with st.expander(f"🧾 View failed Ollama prompt — {task_id}", expanded=False):
+                    st.code(result["prompt"], language="text")
         elif result["status"] == "SKIPPED":
             path = result.get("path", "")
             st.info(f"⊘ {task_id}: Using cached result")

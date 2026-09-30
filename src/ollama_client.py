@@ -13,6 +13,7 @@ Handles:
 import requests
 import json
 import time
+import os
 from typing import Optional, List, Dict, Generator, Tuple
 from dataclasses import dataclass
 from datetime import datetime
@@ -75,15 +76,16 @@ class OllamaClient:
     Supports streaming and non-streaming requests.
     """
     
-    def __init__(self, base_url: str = "http://localhost:11434", timeout: int = 1200):
+    def __init__(self, base_url: Optional[str] = None, timeout: int = 1200):
         """
         Initialize Ollama client.
         
         Args:
-            base_url: Ollama API base URL (default: localhost:11434)
+            base_url: Ollama API base URL. Defaults to ``OLLAMA_HOST`` or
+                ``http://localhost:11434``.
             timeout: Request timeout in seconds (default: 1200)
         """
-        self.base_url = base_url
+        self.base_url = (base_url or os.getenv("OLLAMA_HOST", "http://localhost:11434")).rstrip("/")
         self.timeout = timeout
         self.api_version = "v1"
         
