@@ -15,7 +15,7 @@ PROMPT_FILE = TOOL_DIR / "Test_Prompt.md"
 
 def repository_name(repository_url: str) -> str:
     """Return a safe local directory name from a GitHub-style URL."""
-    parsed = urlparse(repository_url)
+    parsed = urlparse(repository_url.strip())
     name = Path(parsed.path.rstrip("/")).name
     if name.endswith(".git"):
         name = name[:-4]
@@ -35,6 +35,7 @@ def is_git_repository(path: Path) -> bool:
 
 
 def ensure_repository(repository_url: str, clone_root: Path) -> Path:
+    repository_url = repository_url.strip()
     clone_root.mkdir(parents=True, exist_ok=True)
     target = clone_root / repository_name(repository_url)
 

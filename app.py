@@ -1280,6 +1280,7 @@ def render_sidebar() -> None:
 
 def generate_repository_prompt(repository_url: str) -> None:
     """Run the backend workflow and persist its result in session state."""
+    repository_url = repository_url.strip()
     valid, error_message = validate_repository_url(repository_url)
     if not valid:
         st.error(error_message, icon="⚠️")
@@ -1752,19 +1753,21 @@ def aumovio_css(theme: str = "dark") -> str:
     if theme == "light":
         bg, bg2, card = "#FFFFFF", "#F7F4FA", "#FFFFFF"
         text, text2, border = "#1A0B2E", "#5B5570", "#E5DFEC"
+        code_text = "#A63A00"
     else:  # dark (default)
         bg, bg2, card = "#1A0B2E", "#2E0A4F", "#3A1A5C"
         text, text2, border = "#F5F3F7", "#C9BFD6", "#4A2A6C"
-    orange, orange_l, purple = "#FF6A13", "#FF8A3D", "#5B2A86"
+        code_text = "#FF8A3D"
+    orange, orange_hover, purple = "#B54708", "#9A3412", "#5B2A86"
     return f"""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
     :root {{
-        --orange:{orange}; --orange-l:{orange_l}; --purple:{purple};
+        --orange:{orange}; --orange-hover:{orange_hover}; --code-text:{code_text}; --purple:{purple};
         --bg:{bg}; --bg2:{bg2}; --card:{card};
         --text:{text}; --text2:{text2}; --border:{border};
     }}
-    .stApp {{ background:{bg}; }}
+    .stApp {{ background:{bg}; color:{text}; }}
     h1,h2,h3,h4 {{ font-family:'Space Grotesk',sans-serif; color:{text} !important; }}
     p,label,span,li {{ font-family:'DM Sans',sans-serif; }}
     /* Force readable body text on the themed background */
@@ -1781,7 +1784,7 @@ def aumovio_css(theme: str = "dark") -> str:
         box-shadow:0 10px 30px rgba(0,0,0,.25);
     }}
     .av-topbar .brand {{ font-family:'Space Grotesk',sans-serif; font-weight:700; font-size:1.15rem; letter-spacing:.02em; }}
-    .av-topbar .brand small {{ opacity:.85; font-weight:500; }}
+    .av-topbar .brand small {{ opacity:1; font-weight:500; }}
     /* Cards */
     .av-card {{ background:{card}; border:1px solid {border}; border-radius:14px; padding:1rem 1.25rem; margin:.4rem 0; }}
     .av-card h4 {{ margin:0 0 .3rem; }}
@@ -1790,15 +1793,35 @@ def aumovio_css(theme: str = "dark") -> str:
     .av-gate {{ background:{card}; border:1px solid {border}; border-radius:18px; padding:1.6rem; text-align:center; }}
     .av-gate .ico {{ font-size:2.4rem; }}
     .av-gate h3 {{ margin:.4rem 0 .2rem; }}
+    .stApp [data-testid="stTabs"] [data-testid="stTab"] {{ color:{text2} !important; }}
+    .stApp [data-testid="stTabs"] [data-testid="stTab"] * {{ color:inherit !important; }}
+    .stApp [data-testid="stTabs"] [data-testid="stTab"][aria-selected="true"] {{ color:{text} !important; }}
+    .stApp [data-testid="stTabs"] [data-testid="stTab"][aria-selected="true"] * {{ color:inherit !important; }}
+    .stApp [data-testid="stTabs"] [data-baseweb="tab-highlight"] {{ background-color:{orange} !important; }}
+    .stApp [data-testid="stMarkdownContainer"] table {{ background:{card} !important; border-color:{border} !important; }}
+    .stApp [data-testid="stMarkdownContainer"] th,
+    .stApp [data-testid="stMarkdownContainer"] td {{
+        color:{text} !important; background:{card} !important; border-color:{border} !important;
+    }}
+    .stApp [data-testid="stExpander"] details {{ background:{card} !important; border:1px solid {border} !important; }}
+    .stApp [data-testid="stExpander"] summary,
+    .stApp [data-testid="stExpander"] summary * {{
+        color:{text} !important; background:{card} !important;
+    }}
+    .stApp [data-testid="stDownloadButton"] button {{
+        color:{text} !important; background:{card} !important;
+        border:1px solid {border} !important; border-radius:8px;
+    }}
+    .stApp [data-testid="stDownloadButton"] button:hover {{ background:{bg2} !important; }}
     /* Status dot */
     .av-dot {{ height:11px; width:11px; border-radius:50%; display:inline-block; margin-right:7px; vertical-align:middle; }}
     .av-badge {{ display:inline-block; padding:.15rem .6rem; border-radius:999px; font-size:.72rem; font-weight:700; letter-spacing:.04em; }}
     /* Buttons -> Aumovio orange */
     .stButton > button {{ background:{orange}; color:#fff; border:0; border-radius:10px; font-weight:700; }}
-    .stButton > button:hover {{ background:{orange_l}; color:#fff; }}
+    .stButton > button:hover {{ background:{orange_hover}; color:#fff; }}
     [data-testid='stSidebar'] {{ background:{bg2} !important; }}
     [data-testid='stSidebar'] * {{ color:{text} !important; }}
-    .stMarkdown code {{ background:{bg2}; color:{orange_l}; padding:2px 6px; border-radius:4px; border:1px solid {border}; }}
+    .stMarkdown code {{ background:{bg2}; color:{code_text}; padding:2px 6px; border-radius:4px; border:1px solid {border}; }}
     </style>
     """
 
@@ -1835,7 +1858,7 @@ def render_mode_gate() -> None:
         """
         <div style="text-align:center; margin:2rem 0 1rem;">
             <div style="font-family:'Space Grotesk',sans-serif; font-weight:700;
-                        font-size:2rem; background:linear-gradient(90deg,#FF6A13,#5B2A86);
+                        font-size:2rem; background:linear-gradient(90deg,#B54708,#5B2A86);
                         -webkit-background-clip:text; -webkit-text-fill-color:transparent;">
                 AUMOVIO Enterprise Test Generator
             </div>
@@ -1868,14 +1891,14 @@ def render_mode_gate() -> None:
 
 
 STATUS_COLORS = {
-    "idle": "#9CA3AF",
+    "idle": "#5B6472",
     "queued": "#5B2A86",
-    "generating": "#FF8A3D",
-    "validating": "#8B5CF6",
-    "testing": "#FF6A13",
-    "fixing": "#14B8A6",
-    "done": "#22C55E",
-    "error": "#EF4444",
+    "generating": "#B54708",
+    "validating": "#6D28D9",
+    "testing": "#C2410C",
+    "fixing": "#0F766E",
+    "done": "#15803D",
+    "error": "#B91C1C",
 }
 
 # Cross-thread progress store for live branch-graph updates. Written by the
@@ -1902,9 +1925,10 @@ def _branch_diagram_html(models_state: dict) -> str:
     workers = [AGENTS[k] for k in ("unit", "integration", "e2e", "security")]
     worker_labels = ["unit", "integration", "e2e", "security"]
     worker_centers = [95, 285, 475, 665]
+    connector_color = "#A63A00" if st.session_state.get("theme") == "light" else "#FF8A3D"
 
     lines = "".join(
-        f'<line x1="380" y1="86" x2="{cx}" y2="212" stroke="#FF8A3D" stroke-width="2.5" />'
+        f'<line x1="380" y1="86" x2="{cx}" y2="212" stroke="{connector_color}" stroke-width="2.5" />'
         for cx in worker_centers
     )
     master_box = (
@@ -1993,7 +2017,7 @@ def render_model_detail() -> None:
     )
 
     if not data:
-        st.caption("No run data yet. Run a generation to populate this agent.")
+        st.caption("This agent has no results in the current run. Select its test type and run generation to populate it.")
         return
 
     # ── Master (supervisor) view ──
@@ -2023,55 +2047,76 @@ def render_model_detail() -> None:
     failed = data.get("failed", 0)
     errors = data.get("errors", 0)
 
-    st.markdown("##### 📋 What we did")
-    st.write(
-        f"Generated **{task.replace('_',' ')}** for this repository using "
-        f"**{AGENT_MODELS.get(agent, agent)}**, then validated and executed them."
-    )
+    result_tab, prompt_tab, script_tab = st.tabs(["README & Result", "Prompt", "Script"])
+    with result_tab:
+        readme = data.get("readme", "")
+        repo_path = st.session_state.get("repository_path")
+        if repo_path and "results" in data and (not readme or not data.get("readme_summary")):
+            data.setdefault(
+                "script_path",
+                str(Path(repo_path) / "tests" / "test_scripts" / f"{task}_test.py"),
+            )
+            try:
+                _write_agent_readme(repo_path, f"{task}_0", data)
+                readme = data.get("readme", "")
+            except OSError as exc:
+                logger.warning("Could not create compatibility README for %s: %s", agent, exc)
+        if readme:
+            summary = data.get("readme_summary") or readme.split("<!-- FULL_PYTEST_EVIDENCE -->", 1)[0].strip()
+            st.markdown(summary)
+            evidence = data.get("pytest_evidence", "")
+            if not evidence and "<!-- FULL_PYTEST_EVIDENCE -->" in readme:
+                evidence = readme.split("<!-- FULL_PYTEST_EVIDENCE -->", 1)[1]
+                evidence = evidence.partition("## Full Pytest Evidence")[2].strip()
+            if evidence:
+                with st.expander("Show full pytest output", expanded=False):
+                    st.code(evidence, language="text")
+            st.download_button(
+                "⬇️ Download README",
+                data=readme,
+                file_name=f"{task}_README.md",
+                mime="text/markdown",
+                key=f"dl_readme_{agent}",
+            )
+            if data.get("readme_path"):
+                st.caption(f"Saved to `{data['readme_path']}`")
+        else:
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Passed", passed)
+            m2.metric("Failed", failed)
+            m3.metric("Errors", errors)
+            st.info("The per-agent README will appear here after pytest completes.")
 
-    st.markdown("##### ⚙️ How we did it")
-    st.markdown(
-        "1. Read the **real repository source** (grounding — no guessing)\n"
-        "2. Extracted the **actual importable symbols** so imports are valid\n"
-        "3. **Generated** pytest tests with this agent\n"
-        "4. **Validated** them with `test_generation_master`\n"
-        "5. **Executed** with pytest; auto-fixed failures when needed"
-    )
+    with prompt_tab:
+        prompt = data.get("prompt", "")
+        if prompt:
+            st.code(prompt, language="text")
+            st.download_button(
+                "⬇️ Download Prompt",
+                data=prompt,
+                file_name=f"{task}_prompt.md",
+                mime="text/markdown",
+                key=f"dl_prompt_{agent}",
+            )
+        else:
+            if "results" in data:
+                st.info("This earlier run did not capture its prompt. Rerun the agent to save and view the exact prompt.")
+            else:
+                st.info("The generated prompt will appear here when the agent response is available.")
 
-    v = data.get("validation", {})
-    if v:
-        emoji = {"GOLD": "🥇", "SILVER": "🥈", "BRONZE": "🥉"}.get(v.get("level"), "•")
-        st.markdown(f"##### {emoji} Quality verdict: **{v.get('level','?')}**")
-        if v.get("reasons"):
-            st.caption(v["reasons"])
-
-    st.markdown("##### 🎯 Result")
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Passed", passed)
-    m2.metric("Failed", failed)
-    m3.metric("Errors", errors)
-
-    results = data.get("results", [])
-    if results:
-        for t in results:
-            icon = {"PASSED": "✅", "FAILED": "❌", "ERROR": "🟠"}.get(t["status"], "•")
-            st.markdown(f"{icon} `{t['name']}`")
-            if t.get("reason"):
-                st.caption(f"↳ {t['reason']}")
-    else:
-        st.caption("No per-test breakdown available.")
-
-    code = data.get("code", "")
-    if code:
-        with st.expander("📄 View the generated test code", expanded=False):
+    with script_tab:
+        code = data.get("code", "")
+        if code:
             st.code(code, language="python")
             st.download_button(
-                "⬇️ Download",
+                "⬇️ Download Script",
                 data=code,
                 file_name=f"{task}_test.py",
                 mime="text/x-python",
-                key=f"dl_{agent}",
+                key=f"dl_script_{agent}",
             )
+        else:
+            st.info("The generated test script will appear here when the agent returns code.")
 
 
 
@@ -2090,6 +2135,174 @@ def _write_vio_conftest(repo_path: str) -> None:
         )
     except Exception:
         pass
+
+
+def _failure_analysis(test_result: dict) -> tuple[str, str]:
+    """Explain a pytest failure from its observed reason and recommend a fix."""
+    reason = str(test_result.get("reason", "")).strip()
+    lowered = reason.lower()
+
+    if "not writable" in lowered or "read-only" in lowered:
+        return (
+            "The test tried to assign a value to a read-only attribute. The pytest traceback below identifies the object and assignment.",
+            "Do not mutate the read-only attribute. Assert its documented value, or use a small test double that exposes the required writable property.",
+        )
+    if "assertionerror" in lowered or reason.startswith(("+", "-", "?")):
+        return (
+            "An assertion's expected value did not match the observed output. The pytest diff/traceback below is the evidence for the mismatch.",
+            "Derive the expected value from the repository implementation or documented behavior, then assert the relevant result without assuming unrelated stream or CLI state.",
+        )
+    if "modulenotfounderror" in lowered or "importerror" in lowered:
+        return (
+            "Python could not import a module or symbol required by the generated test.",
+            "Verify the symbol exists in this repository version, correct the import root/name, and install the target repository's declared dependencies before rerunning.",
+        )
+    if "attributeerror" in lowered:
+        return (
+            "The test accessed an attribute that the runtime object does not expose in this environment.",
+            "Check the object's real type and public API, then update the test to use a supported attribute or a suitable test double.",
+        )
+    if "typeerror" in lowered:
+        return (
+            "The call received an argument or value incompatible with the callable's runtime signature.",
+            "Compare the test call with the source signature and correct the argument names, types, or setup.",
+        )
+    if reason:
+        return (
+            f"Pytest reported: `{reason}`. This concise reason alone does not establish a deeper cause; use the captured traceback below.",
+            "Follow the first relevant traceback frame into the repository or generated fixture, correct the mismatched assumption, and rerun this test before the full suite.",
+        )
+    return (
+        "Pytest marked this test as failed, but did not provide a concise parsed reason. See the full captured pytest output below.",
+        "Use the traceback and assertion diff in the captured output to correct the test setup or expectation, then rerun the affected script.",
+    )
+
+
+def _write_agent_readme(repo_path: str, task_id: str, result: dict) -> None:
+    """Persist a detailed Markdown README for one agent's test run."""
+    tests = result.get("results", [])
+    failures = [test for test in tests if test.get("status") in {"FAILED", "ERROR"}]
+    validation = result.get("validation", {})
+    task_name = str(result.get("task_type", task_id)).replace("_", " ").title()
+    readme = [
+        f"# {task_name} Results",
+        "",
+        "## Summary",
+        "",
+        "| Status | Passed | Failed | Errors | Quality |",
+        "| --- | ---: | ---: | ---: | --- |",
+        f"| {result.get('status', 'unknown').upper()} | {result.get('passed', 0)} | "
+        f"{result.get('failed', 0)} | {result.get('errors', 0)} | {validation.get('level', 'N/A')} |",
+        "",
+        f"- Agent: `{result.get('agent', 'unknown')}`",
+        f"- Repository: `{Path(repo_path).name}`",
+        f"- Tokens: {result.get('tokens', 0)}",
+    ]
+
+    if validation.get("reasons"):
+        readme.extend(["", "## Validation Notes", "", str(validation["reasons"])])
+
+    readme.extend([
+        "",
+        "## Test Results",
+        "",
+        "| Test | Status | Failure reason |",
+        "| --- | --- | --- |",
+    ])
+    if tests:
+        for test in tests:
+            status = test.get("status", "UNKNOWN")
+            name = str(test.get("name", "Unnamed test")).replace("|", "\\|")
+            reason = str(test.get("reason", "")).replace("|", "\\|").replace("\n", " ")
+            readme.append(f"| `{name}` | **{status}** | {reason or '—'} |")
+            if status in {"FAILED", "ERROR"}:
+                cause, solution = _failure_analysis(test)
+                readme.extend([
+                    "",
+                    f"### Failure analysis: `{name}`",
+                    "",
+                    "**Why it happened (based on pytest evidence):**",
+                    cause,
+                    "",
+                    "**Recommended solution:**",
+                    solution,
+                    "",
+                ])
+    else:
+        readme.append("No per-test results were produced.")
+
+    if not failures and tests:
+        readme.extend(["", f"All **{len(tests)}** generated tests passed."])
+
+    if result.get("fix_attempted") or result.get("fix_error"):
+        readme.extend([
+            "",
+            "## Automated Correction",
+            "",
+            f"- Attempted: **{'Yes' if result.get('fix_attempted') else 'No'}**",
+            f"- Applied: **{'Yes' if result.get('fix_applied') else 'No'}**",
+        ])
+        if result.get("fix_error"):
+            readme.append(f"- Correction error: {result['fix_error']}")
+
+    if result.get("generation_error"):
+        readme.extend([
+            "",
+            "## Generation Error",
+            "",
+            f"The agent request did not produce a test script: `{result['generation_error']}`",
+            "",
+            "**Recommended solution:** verify VIO connectivity and agent access, then retry. If the request succeeds but still returns no code, review the agent response and prompt in the detail panel.",
+            "",
+        ])
+    elif result.get("error"):
+        readme.extend([
+            "",
+            "## Run Error",
+            "",
+            str(result["error"]),
+            "",
+            "**Recommended solution:** inspect the captured pytest output below, correct the first failing import/setup/assertion, and rerun this agent.",
+            "",
+        ])
+
+    summary_content = "\n".join(readme)
+    attempts = result.get("test_attempts", [])
+    evidence = []
+    if attempts:
+        for attempt in attempts:
+            evidence.extend([
+                f"### {attempt.get('label', 'Pytest attempt')}",
+                "",
+                "```text",
+                str(attempt.get("output") or "No pytest output was captured."),
+                "```",
+                "",
+            ])
+    elif failures and not result.get("test_output"):
+        evidence.append("Full pytest output was not captured for this earlier run. The per-test reasons above are the available evidence; rerun to capture the traceback.")
+    elif result.get("test_output"):
+        evidence.extend(["```text", str(result["test_output"]), "```"])
+
+    readme.extend([
+        "",
+        "## Generated Artifacts",
+        "",
+        f"- Prompt: `{result.get('prompt_path', 'not captured for this run')}`",
+        f"- Test script: `{result.get('script_path', 'not generated')}`",
+        "",
+    ])
+    summary_content = "\n".join(readme)
+    content = summary_content
+    if evidence:
+        content += "\n\n<!-- FULL_PYTEST_EVIDENCE -->\n\n## Full Pytest Evidence\n\n" + "\n".join(evidence)
+    readme_path = Path(repo_path) / "tests" / "orchestration_results" / f"{task_id}_README.md"
+    readme_path.parent.mkdir(parents=True, exist_ok=True)
+    readme_path.write_text(content, encoding="utf-8")
+    result["readme"] = content
+    result["readme_summary"] = summary_content
+    result["pytest_evidence"] = "\n".join(evidence)
+    result["readme_path"] = str(readme_path)
 
 
 def _vio_process_task(client, repo_path, source_context, task_type, status_cb=None) -> tuple:
@@ -2112,24 +2325,44 @@ def _vio_process_task(client, repo_path, source_context, task_type, status_cb=No
 
     _report("generating")
     prompt = create_task_prompt(task_type, repo_path)
+    result["prompt"] = prompt
+    prompt_path = Path(repo_path) / "tests" / "orchestration_results" / f"{task_id}_prompt.md"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text(prompt, encoding="utf-8")
+    result["prompt_path"] = str(prompt_path)
     res = client.generate_test(agent, prompt)
     if not res["ok"]:
-        result.update(status="error", validation={"level": "-", "reasons": res["error"]})
+        result.update(
+            status="error",
+            agent=agent,
+            validation={"level": "-", "reasons": res["error"]},
+            generation_error=res["error"],
+            results=[],
+            passed=0,
+            failed=0,
+            errors=1,
+        )
+        _write_agent_readme(repo_path, task_id, result)
         _report("error")
         return agent, result
 
     code = extract_python_code(res["content"])
     elapsed = res["time_s"]
     save_orchestration_result(repo_path, task_id, res["content"])
+    script_path = str(Path(repo_path) / "tests" / "test_scripts" / f"{task_id}_test.py")
 
     _report("validating")
     verdict = client.validate(code, source_context)
 
     _report("testing")
     pyres = run_pytest_single(repo_path, f"{task_id}_test.py")
+    test_attempts = [{"label": "Initial pytest run", "output": pyres["output"]}]
+    fix_attempted = False
+    fix_error = ""
 
     # One fix round if needed
     if pyres["failed"] + pyres["errors"] > 0:
+        fix_attempted = True
         _report("fixing")
         fix = client.fix_test(code, pyres["output"], source_context)
         if fix["ok"]:
@@ -2140,59 +2373,147 @@ def _vio_process_task(client, repo_path, source_context, task_type, status_cb=No
                     "# VIO auto-fixed\n" + fixed + "\n", encoding="utf-8")
                 code = fixed
                 pyres = run_pytest_single(repo_path, f"{task_id}_test.py")
+                test_attempts.append({"label": "Pytest after auto-fix", "output": pyres["output"]})
                 elapsed += fix["time_s"]
-
+        else:
+            fix_error = fix.get("error", "VIO did not return a corrected test.")
     results = parse_pytest_output(pyres["output"])
     all_pass = pyres["passed"] > 0 and pyres["failed"] + pyres["errors"] == 0
-    final_status = "done" if all_pass else ("error" if pyres["passed"] == 0 else "done")
+    final_status = "done" if all_pass or pyres["passed"] > 0 else "error"
     result.update(
         status=final_status,
-        code=code, validation=verdict, results=results,
-        tokens=client.token_usage.get(agent, 0), time_s=elapsed,
-        passed=pyres["passed"], failed=pyres["failed"], errors=pyres["errors"],
+        agent=agent,
+        code=code,
+        prompt=prompt,
+        prompt_path=str(prompt_path),
+        script_path=script_path,
+        validation=verdict,
+        results=results,
+        test_output=pyres["output"],
+        test_attempts=test_attempts,
+        fix_attempted=fix_attempted,
+        fix_applied=bool(fix_attempted and len(test_attempts) > 1),
+        fix_error=fix_error,
+        tokens=client.token_usage.get(agent, 0),
+        time_s=elapsed,
+        passed=pyres["passed"],
+        failed=pyres["failed"],
+        errors=pyres["errors"],
     )
+    _write_agent_readme(repo_path, task_id, result)
     _report(final_status)
     return agent, result
 
 
-def _vio_background_run(client, repo_path, source_context, selected_types, parallel) -> None:
-    """Run the VIO pipeline in a background thread, updating VIO_LIVE live."""
-    def work(tt):
-        agent = TYPE_TO_AGENT.get(tt, AGENTS["unit"])
-        try:
-            a, result = _vio_process_task(
-                client, repo_path, source_context, tt,
-                status_cb=lambda s: VIO_LIVE["progress"].__setitem__(agent, s),
-            )
-            VIO_LIVE["results"][a] = result
-            VIO_LIVE["progress"][a] = result.get("status", "done")
-        except Exception as exc:  # pragma: no cover - defensive
-            VIO_LIVE["progress"][agent] = "error"
-            VIO_LIVE["results"][agent] = {
-                "status": "error", "task_type": tt,
-                "validation": {"level": "-", "reasons": str(exc)},
-            }
+def _vio_background_run(
+    client,
+    repo_path,
+    selected_types,
+    parallel,
+    models_state,
+    run_state,
+) -> None:
+    """Run VIO tasks without calling Streamlit from the worker thread."""
+    def set_status(agent, status):
+        models_state[agent] = {**models_state.get(agent, {}), "status": status}
 
     try:
+        for sub in ("test_scripts", "orchestration_results"):
+            directory = Path(repo_path) / "tests" / sub
+            if directory.exists():
+                for path in directory.glob("*"):
+                    try:
+                        if path.is_file():
+                            path.unlink()
+                    except OSError:
+                        logger.warning("Could not remove stale VIO artifact: %s", path)
+
+        source_context, _ = gather_source_context(repo_path, max_chars=8000)
+        scripts_dir = Path(repo_path) / "tests" / "test_scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_vio_conftest(repo_path)
+
+        def work(task_type):
+            agent = TYPE_TO_AGENT.get(task_type, AGENTS["unit"])
+            try:
+                result_agent, result = _vio_process_task(
+                    client,
+                    repo_path,
+                    source_context,
+                    task_type,
+                    status_cb=lambda status: set_status(agent, status),
+                )
+                models_state[result_agent] = result
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.exception("VIO task failed for %s", task_type)
+                failure = {
+                    "status": "error",
+                    "agent": agent,
+                    "task_type": task_type,
+                    "error": str(exc),
+                    "validation": {"level": "-", "reasons": str(exc)},
+                    "results": [],
+                    "passed": 0,
+                    "failed": 0,
+                    "errors": 1,
+                }
+                try:
+                    _write_agent_readme(repo_path, f"{task_type}_0", failure)
+                except Exception:
+                    logger.exception("Could not write the failure README for %s", task_type)
+                models_state[agent] = failure
+
         if parallel and len(selected_types) > 1:
-            with ThreadPoolExecutor(max_workers=min(4, len(selected_types))) as ex:
-                list(ex.map(work, selected_types))
+            with ThreadPoolExecutor(max_workers=min(4, len(selected_types))) as executor:
+                list(executor.map(work, selected_types))
         else:
-            for tt in selected_types:
-                work(tt)
+            for task_type in selected_types:
+                work(task_type)
+
+        summary_lines = [
+            f"- {agent} ({result.get('task_type', '')}): "
+            f"{result.get('passed', 0)} passed, {result.get('failed', 0)} failed, "
+            f"{result.get('errors', 0)} errors; "
+            f"validation={result.get('validation', {}).get('level', '?')}"
+            for agent, result in models_state.items()
+            if agent != AGENTS["master"] and "passed" in result
+        ]
+        report_text = ""
+        if summary_lines:
+            report = client.report(
+                "Repository: " + str(repo_path) + "\n" + "\n".join(summary_lines)
+            )
+            if report.get("ok"):
+                report_text = report["content"]
+
+        validations = [
+            {
+                "agent": agent,
+                "level": result.get("validation", {}).get("level", "?"),
+                "reasons": result.get("validation", {}).get("reasons", ""),
+            }
+            for agent, result in models_state.items()
+            if agent != AGENTS["master"] and result.get("validation")
+        ]
+        models_state[AGENTS["master"]] = {
+            "status": "done",
+            "task_type": "supervision",
+            "tokens": client.token_usage.get(AGENTS["master"], 0),
+            "validations": validations,
+            "report": report_text,
+            "repo": str(repo_path),
+        }
+        run_state["report"] = report_text
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("VIO orchestration failed")
+        run_state["error"] = str(exc)
     finally:
-        VIO_LIVE["done"] = True
+        run_state["active"] = False
+        run_state["finished"] = True
 
 
-
-def run_vio_orchestration(selected_types: list, parallel: bool = True, graph_ph=None) -> None:
-    """Generate + validate + run + fix tests using the VIO agents.
-
-    Redraws the branch diagram into `graph_ph` (an st.empty) after every status
-    change so the graph updates LIVE on the main thread (no background threads).
-    Sequential mode shows every step (generate→validate→test→fix); parallel mode
-    lights up each agent as it completes.
-    """
+def _legacy_run_vio_orchestration(selected_types: list, parallel: bool = True, graph_ph=None) -> None:
+    """Previous synchronous implementation, retained temporarily for reference."""
     client = st.session_state.get("vio_client")
     repo_path = st.session_state.get("repository_path")
     if not client:
@@ -2225,6 +2546,9 @@ def run_vio_orchestration(selected_types: list, parallel: bool = True, graph_ph=
     }
 
     def redraw():
+        st.session_state["models"] = {
+            agent: dict(agent_data) for agent, agent_data in live.items()
+        }
         if graph_ph is not None:
             graph_ph.markdown(_branch_diagram_html(live), unsafe_allow_html=True)
 
@@ -2254,7 +2578,6 @@ def run_vio_orchestration(selected_types: list, parallel: bool = True, graph_ph=
                 for agent, s in list(shared.items()):
                     if agent in live and "passed" not in live[agent]:
                         live[agent]["status"] = s
-                redraw()
                 time.sleep(0.4)
 
             # Collect final results.
@@ -2271,7 +2594,6 @@ def run_vio_orchestration(selected_types: list, parallel: bool = True, graph_ph=
 
             def _cb(s, a=agent):
                 live[a]["status"] = s
-                redraw()
 
             a, result = _vio_process_task(client, repo_path, source_context, tt, status_cb=_cb)
             live[a] = result
@@ -2317,6 +2639,50 @@ def run_vio_orchestration(selected_types: list, parallel: bool = True, graph_ph=
 
     st.session_state["models"] = live
     st.success("VIO generation complete! Click a branch to inspect each agent.")
+
+
+def run_vio_orchestration(selected_types: list, parallel: bool = True) -> None:
+    """Initialize shared per-agent state and launch VIO work in a background thread."""
+    client = st.session_state.get("vio_client")
+    repo_path = st.session_state.get("repository_path")
+    if not client:
+        st.error("Connect to VIO first.")
+        return
+    if not repo_path:
+        st.error("Clone a repository first (enter a URL and generate).")
+        return
+
+    current_run = st.session_state.get("vio_run_state") or {}
+    if current_run.get("active"):
+        st.warning("VIO generation is already running.")
+        return
+
+    models_state = {
+        TYPE_TO_AGENT.get(task_type, AGENTS["unit"]): {
+            "status": "queued",
+            "task_type": task_type,
+            "tokens": 0,
+        }
+        for task_type in selected_types
+    }
+    models_state.setdefault(
+        AGENTS["master"], {"status": "idle", "task_type": "supervision", "tokens": 0}
+    )
+    run_state = {"active": True, "finished": False, "report": "", "error": ""}
+    st.session_state["models"] = models_state
+    st.session_state["vio_run_state"] = run_state
+    if not st.session_state.get("selected_model"):
+        st.session_state["selected_model"] = TYPE_TO_AGENT.get(
+            selected_types[0], AGENTS["unit"]
+        )
+
+    worker = threading.Thread(
+        target=_vio_background_run,
+        args=(client, repo_path, selected_types.copy(), parallel, models_state, run_state),
+        name="vio-test-generation",
+        daemon=True,
+    )
+    worker.start()
 
 
 def _start_vio_run(client, repo_path: str, selected_types: list, parallel: bool) -> None:
@@ -2366,19 +2732,7 @@ def render_vio_workspace() -> None:
     if not connected and st.session_state.get("vio_failures", 0) >= 3:
         st.warning("VIO failed 3+ times. Consider switching to Ollama (offline) mode.")
 
-    # Interactive agent branch graph (master → workers). The diagram lives in a
-    # placeholder so it can be redrawn live during a run; buttons stay separate.
-    st.markdown("#### Agent Branches")
-    st.caption("Click any agent node to see its task, generated tests, and results.")
-    graph_ph = st.empty()
-    graph_ph.markdown(
-        _branch_diagram_html(st.session_state.get("models", {})),
-        unsafe_allow_html=True,
-    )
-    render_branch_controls()
-
-    # Master-detail panel for the selected agent
-    render_model_detail()
+    render_vio_results_panel()
 
     # ── Generation controls ──
     st.markdown("---")
@@ -2409,9 +2763,10 @@ def render_vio_workspace() -> None:
     )
 
     run_col, dep_col = st.columns([1, 1])
+    run_state = st.session_state.get("vio_run_state") or {}
     with run_col:
         run = st.button("▶️ Generate with VIO Agents", use_container_width=True,
-                        disabled=not connected)
+                        disabled=not connected or run_state.get("active", False))
     with dep_col:
         if st.button("📦 Install Repo Dependencies", use_container_width=True,
                      key="vio_install_deps"):
@@ -2435,28 +2790,7 @@ def render_vio_workspace() -> None:
         else:
             generate_repository_prompt(repo_url)  # clone + set repository_path
             if st.session_state.get("repository_path"):
-                run_vio_orchestration(selected_types, parallel=parallel, graph_ph=graph_ph)
-                st.rerun()  # refresh scorecard/detail with final state
-
-    # ── Aggregate scorecard ──
-    models = st.session_state.get("models", {})
-    ran = [m for m in models.values() if m.get("results") is not None or "passed" in m]
-    if ran:
-        total_p = sum(m.get("passed", 0) for m in ran)
-        total_f = sum(m.get("failed", 0) for m in ran)
-        total_e = sum(m.get("errors", 0) for m in ran)
-        total_tok = sum(m.get("tokens", 0) for m in ran)
-        st.markdown("#### Results")
-        s1, s2, s3, s4 = st.columns(4)
-        s1.metric("Passed", total_p)
-        s2.metric("Failed", total_f)
-        s3.metric("Errors", total_e)
-        s4.metric("Tokens", total_tok)
-
-        report = st.session_state.get("vio_report")
-        if report:
-            with st.expander("📝 Final report (by test_generation_master)", expanded=False):
-                st.markdown(report)
+                run_vio_orchestration(selected_types, parallel=parallel)
 
 
 def main() -> None:
@@ -2521,60 +2855,77 @@ def main() -> None:
     # Display repository information status
     st.markdown("### Repository information")
     details = st.columns(4)
-    with details[0]:
-        status_badge("Repository Name", st.session_state["repository_name"] or "—", "◈")
-    with details[1]:
-        status_badge("Clone Status", st.session_state["clone_status"], "↻")
-    with details[2]:
-        status_badge("Prompt Status", st.session_state["prompt_status"], "✓")
-    with details[3]:
-        status_badge("Local Path", st.session_state["repository_path"] or "—", "⌂")
+    run_state = st.session_state.get("vio_run_state", {})
+    if run_state.get("active"):
+        st.warning("VIO generation is already running.")
+        return
 
-    # Workflow section: Show generated prompt and approval gate
-    if st.session_state["generated_prompt"]:
-        if st.session_state["approval_status"] == "Pending":
-            # Show generated prompt for review
-            st.markdown("---")
-            st.markdown("### 📝 Generated Test_Prompt.md")
-            st.caption(
-                "Review the generated prompt below. You can download it or proceed with "
-                "the Copilot Chat workflow."
-            )
-            
-            with st.expander("📋 View Full Prompt", expanded=True):
-                st.markdown(st.session_state["generated_prompt"])
-            
-            # Download button for prompt
-            st.download_button(
-                "📥 Download Test_Prompt.md",
-                data=st.session_state["generated_prompt"],
-                file_name="Test_Prompt.md",
-                mime="text/markdown",
-                use_container_width=False,
-            )
-            
-            # Display approval gate with Proceed/Reject buttons
-            display_approval_gate()
-    
-    # Workflow section: Show results loading when proceed is clicked
-    if st.session_state["proceed_clicked"]:
-        # Show success message with next steps
-        st.markdown("---")
-        st.success(
-            "✅ Prompt copied to clipboard!\n\n"
-            "**Next steps:**\n"
-            "1. Open Copilot Chat in VS Code (Ctrl+Shift+I)\n"
-            "2. Paste the prompt (Ctrl+V) and press Enter\n"
-            "3. Save the generated files in the tests/ folder\n"
-            "4. Return here and click 'Load Results'"
+    models_state = {
+        TYPE_TO_AGENT.get(task_type, AGENTS["unit"]): {
+            "status": "queued",
+            "task_type": task_type,
+            "tokens": 0,
+        }
+        for task_type in selected_types
+    }
+    models_state.setdefault(
+        AGENTS["master"], {"status": "idle", "task_type": "supervision", "tokens": 0}
+    )
+    run_state = {"active": True, "finished": False, "report": "", "error": ""}
+    st.session_state["models"] = models_state
+    st.session_state["vio_run_state"] = run_state
+    if not st.session_state.get("selected_model"):
+        st.session_state["selected_model"] = TYPE_TO_AGENT.get(
+            selected_types[0], AGENTS["unit"]
         )
-        
-        # Display orchestration section (intelligent test generation)
-        display_orchestrator_section()
-        
-        # Display results loading and viewing section
-        display_results_section()
+
+    worker = threading.Thread(
+        target=_vio_background_run,
+        args=(client, repo_path, selected_types.copy(), parallel, models_state, run_state),
+        name="vio-test-generation",
+        daemon=True,
+    )
+    worker.start()
 
 
-if __name__ == "__main__":
-    main()
+@st.fragment(run_every=1)
+def render_vio_results_panel() -> None:
+    """Refresh agent status and details without rerunning the main script."""
+    models = st.session_state.get("models", {})
+    run_state = st.session_state.get("vio_run_state", {})
+
+    st.markdown("#### Agent Branches")
+    st.caption("The diagram shows agent status. Use the agent buttons below to view details.")
+    st.markdown(_branch_diagram_html(models), unsafe_allow_html=True)
+    render_branch_controls()
+    render_model_detail()
+
+    if run_state.get("active"):
+        st.info("VIO generation is running in the background. Agent selections and results update live.")
+    elif run_state.get("error"):
+        st.error(f"VIO generation stopped: {run_state['error']}")
+    elif run_state.get("finished"):
+        st.success("VIO generation complete.")
+
+    ran = [model for model in models.values() if model.get("results") is not None or "passed" in model]
+    if ran:
+        total_passed = sum(model.get("passed", 0) for model in ran)
+        total_failed = sum(model.get("failed", 0) for model in ran)
+        total_errors = sum(model.get("errors", 0) for model in ran)
+        total_tokens = sum(model.get("tokens", 0) for model in ran)
+        st.markdown("#### Results")
+        columns = st.columns(4)
+        for column, label, value in zip(
+            columns,
+            ("Passed", "Failed", "Errors", "Tokens"),
+            (total_passed, total_failed, total_errors, total_tokens),
+        ):
+            column.metric(label, value)
+
+    report = run_state.get("report") or st.session_state.get("vio_report")
+    if report:
+        with st.expander("📝 Final report (by test_generation_master)", expanded=True):
+            st.markdown(report)
+
+
+main()
