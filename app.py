@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import json
 import subprocess
 import time
 import zipfile
@@ -24,9 +25,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
 from datetime import datetime
-from typing import List
+from typing import List, Dict, Any
 
 import streamlit as st
+import pandas as pd
 
 # Import the copilot_bridge module for automation functions
 from src import copilot_bridge
@@ -48,6 +50,7 @@ from src.orchestrator.task_router import TaskRouter, TaskType, TaskStatus
 
 # VIO (Aumovio online agents) + environment loading
 from src.vio_client import VIOClient, AGENTS, AGENT_MODELS, TYPE_TO_AGENT
+from src.test_runner import run_pytest, save_test_script, parse_worker_output, save_agent_output, save_test_result, validate_python_code, extract_test_cases_from_code, extract_test_spec_from_code
 
 try:
     from streamlit_agraph import agraph, Node, Edge, Config
@@ -660,23 +663,60 @@ def build_symbol_index(source_context: str) -> str:
 def create_task_prompt(task_type: str, repo_path: str) -> str:
     """Create an Ollama prompt for a specific task type, grounded in real code.
 
-    Combines three inputs:
-    1. High-level guidance distilled from the repo's Test_Prompt.md (if present).
-    2. The actual repository source code (ground truth).
-    3. An explicit list of importable symbols parsed from that source.
+    ENHANCED v2 (100% Coverage Mode):
+    1. Reads enhanced prompt from /src/prompts/{task_type}_test.md (v2 with comprehensive coverage requirements)
+    2. Appends the actual repository source code (ground truth)
+    3. Adds explicit list of importable symbols
+    4. Falls back to dynamic prompt if file doesn't exist
     """
     repo_path_obj = Path(repo_path)
-
     source_context, package = gather_source_context(str(repo_path_obj))
 
-    # 1. High-level guidance from the folder prompt (kept short so it doesn't
-    #    derail a small model into writing prose instead of code).
-    guidance = ""
-    prompt_file = repo_path_obj / "Test_Prompt.md"
-    if prompt_file.exists():
+    # STEP 1: Try to read enhanced prompt from /src/prompts/
+    # Map task_type to prompt filename
+    prompt_file_map = {
+        "unit_test": "unit_test.md",
+        "integration_test": "integration_test.md",
+        "e2e_test": "e2e_test.md",
+        "api_test": "e2e_test.md",
+        "security": "security_test.md",
+        "vulnerability": "security_test.md",
+    }
+    
+    prompt_filename = prompt_file_map.get(task_type, f"{task_type}_test.md")
+    enhanced_prompt_path = Path(__file__).parent / "prompts" / prompt_filename
+    
+    if enhanced_prompt_path.exists():
         try:
-            full = prompt_file.read_text(encoding="utf-8")
-            # Take the opening objective paragraph(s) only.
+            enhanced_prompt = enhanced_prompt_path.read_text(encoding="utf-8")
+            logger.info(f"✓ Using enhanced v2 prompt from {enhanced_prompt_path.name}")
+            
+            # Append source code to enhanced prompt
+            if source_context:
+                symbol_index = build_symbol_index(source_context)
+                allowed_block = (
+                    f"\n## IMPORTABLE SYMBOLS\nimport ONLY names from this exact list:\n{symbol_index}\n\n"
+                    if symbol_index else ""
+                )
+                source_block = (
+                    f"\n## REPOSITORY SOURCE CODE (ground truth)\n```python\n{source_context}\n```\n"
+                )
+                return enhanced_prompt + allowed_block + source_block
+            else:
+                return enhanced_prompt
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to read enhanced prompt from {enhanced_prompt_path}: {e}")
+            # Fall through to dynamic prompt generation below
+
+    # FALLBACK: Dynamic prompt generation (old behavior)
+    logger.info(f"ℹ️ Enhanced prompt not found, using dynamic prompt generation for {task_type}")
+    
+    # High-level guidance from the repo's Test_Prompt.md (if present)
+    guidance = ""
+    repo_test_prompt = repo_path_obj / "Test_Prompt.md"
+    if repo_test_prompt.exists():
+        try:
+            full = repo_test_prompt.read_text(encoding="utf-8")
             guidance = full.strip()[:600]
         except Exception:
             guidance = ""
@@ -705,8 +745,20 @@ def create_task_prompt(task_type: str, repo_path: str) -> str:
             f"- Only test functions/classes that actually appear in the code below.\n"
             f"- Write EXACTLY 3 short tests so your answer is COMPLETE and not cut off. "
             f"Keep the whole answer concise (under ~30 lines).\n"
-            f"- Use the AAA pattern and name tests test_*.\n"
-            f"- Output ONLY a single ```python fenced code block, and you MUST end with a closing ```.\n\n"
+            f"- Use the AAA pattern and name tests test_*.\n\n"
+            f"OUTPUT FORMAT (choose one):\n"
+            f"OPTION A (preferred): Wrap in ```json with this structure:\n"
+            f"{{\n"
+            f'  "cases": [{{"name": "test_example", "input": "sample", "expected": "result", "category": "unit"}}],\n'
+            f'  "spec": {{"type": "{task_type}", "file": "module.py", "func": "func", "imports_used": [], "assumptions": "", "fixtures": "", "edge_cases_covered": []}},\n'
+            f'  "script": "import pytest\\n\\ndef test_example():\\n    pass"\n'
+            f"}}\n\n"
+            f"OPTION B (fallback): Just output a single ```python code block:\n"
+            f"```python\n"
+            f"import pytest\n\n"
+            f"def test_example():\n"
+            f"    pass\n"
+            f"```\n\n"
             f"{allowed_block}"
             f"===== REPOSITORY SOURCE (ground truth) =====\n"
             f"{source_context}\n"
@@ -718,7 +770,8 @@ def create_task_prompt(task_type: str, repo_path: str) -> str:
         f"You are an expert test engineer. Generate comprehensive {task_type} "
         f"tests as valid, runnable pytest Python code for the repository located "
         f"at {repo_path_obj}. Include multiple test functions named test_*, "
-        f"use the AAA pattern, and wrap all code in ```python fenced blocks."
+        f"use the AAA pattern, and wrap all code in ```json code blocks with the structure: "
+        f'{{"cases": [...], "spec": {{...}}, "script": "..."}}'
     )
 
 
@@ -730,28 +783,63 @@ def extract_python_code(content: str) -> str:
     """Extract Python source from an LLM markdown response.
 
     Handles three cases:
-    1. One or more complete ```python ... ``` fenced blocks.
-    2. An UNCLOSED fence (model output truncated before the closing ```): take
-       everything after the first fence line, up to a closing fence if present.
-    3. No fences at all: return the raw content.
+    1. One or more complete ```python ... ``` fenced blocks (preferred).
+    2. Generic ``` blocks (if no python/py tags) - but skip JSON blocks.
+    3. No fences: return empty string (don't return raw JSON/content).
     """
-    # Case 1: complete language-tagged blocks.
+    if not content:
+        return ""
+    
+    # Case 1: Look FIRST for explicit ```python or ```py tagged blocks.
     blocks = re.findall(r"```(?:python|py)\s*\n(.*?)```", content, re.DOTALL)
-    if not blocks:
-        blocks = re.findall(r"```\s*\n(.*?)```", content, re.DOTALL)
     if blocks:
-        return "\n\n".join(b.strip("\n") for b in blocks if b.strip())
+        combined = "\n\n".join(b.strip("\n") for b in blocks if b.strip())
+        if combined:
+            logger.debug(f"extract_python_code: Found {len(blocks)} ```python blocks, {len(combined)} chars extracted")
+            return combined
 
-    # Case 2: an opening fence with no matching close (truncated output).
-    m = re.search(r"```[a-zA-Z0-9_+-]*[ \t]*\n", content)
-    if m:
-        rest = content[m.end():]
-        # Cut at a closing fence if one exists further down.
-        rest = re.split(r"\n```", rest)[0]
-        return rest.strip()
-
-    # Case 3: bare code.
-    return content.strip()
+    # Case 2: Generic ``` blocks, but NOT ```json or other non-python blocks.
+    generic_blocks = re.findall(r"```\s*\n(.*?)```", content, re.DOTALL)
+    logger.debug(f"extract_python_code: Found {len(generic_blocks)} generic code blocks")
+    
+    python_blocks = []
+    
+    for i, block in enumerate(generic_blocks):
+        block_stripped = block.strip()
+        if not block_stripped:
+            continue
+        
+        # Skip JSON/list blocks (they start with JSON indicators)
+        if block_stripped.startswith(("{", "[")):
+            logger.debug(f"  Block {i}: Skipped (JSON/list)")
+            continue
+        
+        # Heuristics to identify Python code (not config, not yaml, not sql)
+        # Look for common Python patterns
+        is_python = any([
+            "def " in block_stripped,
+            "class " in block_stripped,
+            "import " in block_stripped,
+            "from " in block_stripped,
+            "@" in block_stripped and "def " in block_stripped,  # decorators
+            "assert " in block_stripped,
+            "if __name__" in block_stripped,
+        ])
+        
+        if is_python:
+            logger.debug(f"  Block {i}: Identified as Python ({len(block_stripped)} chars)")
+            python_blocks.append(block_stripped)
+        else:
+            logger.debug(f"  Block {i}: Not Python-like ({len(block_stripped)} chars, starts with: {block_stripped[:50]})")
+    
+    if python_blocks:
+        result = "\n\n".join(python_blocks)
+        logger.debug(f"extract_python_code: Extracted {len(python_blocks)} Python blocks, total {len(result)} chars")
+        return result
+    
+    # Case 3: No valid Python code blocks found. Return empty string rather than raw content.
+    logger.debug(f"extract_python_code: No Python code blocks found in {len(content)} char response")
+    return ""
 
 
 
@@ -1199,18 +1287,78 @@ def parse_pytest_output(output: str) -> list[dict]:
 
 
 
+def get_venv_python(repo_path: str) -> tuple[str, bool]:
+    """Get the Python executable path for a repo's virtual environment.
+    
+    Creates the venv if it doesn't exist.
+    Returns (python_path, success) where success=False means venv creation failed.
+    """
+    repo = Path(repo_path)
+    venv_path = repo / ".venv"
+    
+    # Python executable path inside venv
+    if os.name == "nt":  # Windows
+        python_exe = venv_path / "Scripts" / "python.exe"
+    else:  # Unix/Linux/macOS
+        python_exe = venv_path / "bin" / "python"
+    
+    # If venv already exists, return the path
+    if python_exe.exists():
+        return str(python_exe), True
+    
+    # Create venv if it doesn't exist
+    logger.info(f"Creating virtual environment at {venv_path}")
+    try:
+        subprocess.run(
+            ["python", "-m", "venv", str(venv_path)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=True,
+        )
+        logger.info(f"✅ Virtual environment created at {venv_path}")
+        return str(python_exe), True
+    except Exception as e:
+        logger.error(f"Failed to create venv: {e}")
+        return "", False
+
+
 def install_repo_dependencies(repo_path: str) -> dict:
-    """Install the target repository's dependencies with pip.
+    """Install the target repository's dependencies in its isolated virtual environment.
 
     Tries an editable install (pip install -e .) when a pyproject.toml or setup.py
     exists, otherwise installs from requirements*.txt. This makes the repo's
     package (and its dependencies) importable so generated tests can run.
+    
+    Uses the repo's .venv/ virtual environment to keep dependencies isolated.
     """
     repo = Path(repo_path)
-    result = {"success": False, "message": "", "output": ""}
+    result = {"success": False, "message": "", "output": "", "venv_python": ""}
 
+    # Get or create the repo's virtual environment
+    venv_python, venv_ok = get_venv_python(repo_path)
+    if not venv_ok or not venv_python:
+        result["message"] = "❌ Failed to create virtual environment for this repository."
+        return result
+    
+    result["venv_python"] = venv_python
+    
+    # Upgrade pip in the venv first
+    logger.info("Upgrading pip in virtual environment...")
+    try:
+        subprocess.run(
+            [venv_python, "-m", "pip", "install", "--upgrade", "pip", "-q"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except Exception as e:
+        logger.warning(f"Could not upgrade pip: {e}")
+
+    # Determine what to install
     if (repo / "pyproject.toml").exists() or (repo / "setup.py").exists():
-        cmd = ["python", "-m", "pip", "install", "-e", ".", "-q"]
+        cmd = [venv_python, "-m", "pip", "install", "-e", ".", "-q"]
+        install_type = "editable install (pyproject.toml/setup.py)"
     else:
         req = next(
             (repo / name for name in ("requirements.txt", "requirements-dev.txt")
@@ -1218,25 +1366,53 @@ def install_repo_dependencies(repo_path: str) -> dict:
             None,
         )
         if req is None:
-            result["message"] = "No pyproject.toml, setup.py, or requirements.txt found."
+            result["message"] = "⚠️ No pyproject.toml, setup.py, or requirements.txt found. Tests may fail due to missing imports."
             return result
-        cmd = ["python", "-m", "pip", "install", "-r", str(req), "-q"]
+        cmd = [venv_python, "-m", "pip", "install", "-r", str(req), "-q"]
+        install_type = f"requirements install ({req.name})"
 
     try:
+        logger.info(f"Installing dependencies in venv: {install_type}")
         proc = subprocess.run(
             cmd, cwd=str(repo), capture_output=True, text=True, timeout=900
         )
         result["output"] = (proc.stdout or "") + (proc.stderr or "")
         result["success"] = proc.returncode == 0
         result["message"] = (
-            "✅ Dependencies installed — the repo package is now importable."
+            f"✅ Dependencies installed in {repo.name}/.venv — ready for testing."
             if result["success"]
-            else "⚠️ pip finished with errors (see output). Some imports may still fail."
+            else f"⚠️ Dependency install had errors ({install_type}). Tests may fail on missing imports."
         )
+        logger.info(f"Install result: {result['message']}")
     except subprocess.TimeoutExpired:
-        result["message"] = "Dependency install timed out after 15 minutes."
-    except Exception as exc:  # pragma: no cover - defensive
-        result["message"] = f"Install failed: {exc}"
+        result["message"] = "❌ Dependency install timed out after 15 minutes."
+    except Exception as exc:
+        result["message"] = f"❌ Install failed: {exc}"
+
+    # CRITICAL: Always ensure pytest and common plugins are installed in the venv
+    # (They may not be included in repo's main dependencies)
+    if result["success"]:
+        logger.info("Ensuring pytest and common plugins are installed in venv...")
+        try:
+            # Install pytest + commonly used plugins that projects often configure
+            # pytest-timeout: handles timeout config option in pytest.ini/pyproject.toml
+            # pytest-asyncio: handles async test functions
+            # pytest-xdist: parallel test execution
+            plugins = ["pytest", "pytest-cov", "pytest-timeout", "pytest-asyncio"]
+            pytest_install = subprocess.run(
+                [venv_python, "-m", "pip", "install"] + plugins + ["-q"],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if pytest_install.returncode == 0:
+                logger.info(f"✅ pytest and plugins installed: {', '.join(plugins)}")
+            else:
+                logger.warning(f"⚠️ pytest plugin install had issues: {pytest_install.stderr}")
+                result["message"] += "\n⚠️ pytest plugin install had warnings (tests may still run)"
+        except Exception as e:
+            logger.warning(f"Could not install pytest plugins in venv: {e}")
+            result["message"] += f"\n⚠️ pytest plugin install failed ({e}), tests may not run"
 
     return result
 
@@ -1986,6 +2162,64 @@ def render_branch_controls() -> None:
                 st.session_state["selected_model"] = agent
 
 
+def _build_test_readme(
+    agent: str,
+    model_name: str,
+    task_type: str,
+    cases: List[Dict[str, Any]],
+    spec: Dict[str, Any],
+    script: str,
+    pytest_result: Dict[str, Any],
+    validation_level: str,
+) -> str:
+    """Build markdown README for a single test artifact."""
+    md = f"""# 🧪 {task_type.replace("_", " ").title()}
+
+**Agent**: {agent}  
+**Model**: {model_name}  
+**Quality**: {validation_level}  
+**Generated**: {pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+## 📋 Test Summary
+
+| Metric | Value |
+|--------|-------|
+| Status | {'✅ Passed' if pytest_result.get('status') == 'passed' else '❌ Failed'} |
+| Passed | {pytest_result.get('passed', 0)} |
+| Failed | {pytest_result.get('failed', 0)} |
+| Duration | {pytest_result.get('duration', 0):.2f}s |
+
+## 📝 Test Cases
+
+| # | Name | Input | Expected | Category |
+|---|------|-------|----------|----------|
+"""
+    
+    for i, case in enumerate(cases, 1):
+        md += (
+            f"| {i} | `{case.get('name', '?')}` | "
+            f"`{case.get('input', '?')}` | "
+            f"`{case.get('expected', '?')}` | "
+            f"{case.get('category', '?')} |\n"
+        )
+    
+    md += "\n## 📄 Test Specification\n\n"
+    for key, value in spec.items():
+        if isinstance(value, list):
+            value = ", ".join(str(v) for v in value)
+        md += f"- **{key}**: {value}\n"
+    
+    md += f"\n## 💻 Test Script\n\n```python\n{script}\n```\n"
+    md += f"\n## 📊 Execution Result\n\n```\n{pytest_result.get('logs', '')}\n```\n"
+    
+    if pytest_result.get("failures"):
+        md += "\n## ❌ Failures\n\n"
+        for failure in pytest_result["failures"]:
+            md += f"- `{failure['test']}`: {failure['error']}\n"
+    
+    return md
+
+
 def render_branch_graph() -> None:
     """Static branch view: diagram (from session models) + selection buttons."""
     st.markdown(
@@ -1996,7 +2230,7 @@ def render_branch_graph() -> None:
 
 
 def render_model_detail() -> None:
-    """Clean, README-style master-detail panel for the selected agent."""
+    """Clean, 4-tab artifact panel for the selected agent."""
     agent = st.session_state.get("selected_model")
     if not agent:
         st.caption("👆 Click an agent node above to see its details.")
@@ -2017,7 +2251,7 @@ def render_model_detail() -> None:
     )
 
     if not data:
-        st.caption("This agent has no results in the current run. Select its test type and run generation to populate it.")
+        st.caption("👆 No run data yet. Select test types and generate to populate this agent.")
         return
 
     # ── Master (supervisor) view ──
@@ -2041,82 +2275,218 @@ def render_model_detail() -> None:
             st.markdown(data["report"])
         return
 
-    # ── Worker (README-style) view ──
+    # ── Worker (4-tab) view ──
     task = data.get("task_type", "—")
-    passed = data.get("passed", 0)
-    failed = data.get("failed", 0)
-    errors = data.get("errors", 0)
+    cases = data.get("cases", [])
+    spec = data.get("spec", {})
+    script = data.get("script", "")
+    pytest_result = data.get("pytest_result", {})
+    validation_level = data.get("validation", {}).get("level", "UNKNOWN")
 
-    result_tab, prompt_tab, script_tab = st.tabs(["README & Result", "Prompt", "Script"])
-    with result_tab:
-        readme = data.get("readme", "")
-        repo_path = st.session_state.get("repository_path")
-        if repo_path and "results" in data and (not readme or not data.get("readme_summary")):
-            data.setdefault(
-                "script_path",
-                str(Path(repo_path) / "tests" / "test_scripts" / f"{task}_test.py"),
-            )
-            try:
-                _write_agent_readme(repo_path, f"{task}_0", data)
-                readme = data.get("readme", "")
-            except OSError as exc:
-                logger.warning("Could not create compatibility README for %s: %s", agent, exc)
-        if readme:
-            summary = data.get("readme_summary") or readme.split("<!-- FULL_PYTEST_EVIDENCE -->", 1)[0].strip()
-            st.markdown(summary)
-            evidence = data.get("pytest_evidence", "")
-            if not evidence and "<!-- FULL_PYTEST_EVIDENCE -->" in readme:
-                evidence = readme.split("<!-- FULL_PYTEST_EVIDENCE -->", 1)[1]
-                evidence = evidence.partition("## Full Pytest Evidence")[2].strip()
-            if evidence:
-                with st.expander("Show full pytest output", expanded=False):
-                    st.code(evidence, language="text")
+    tab_cases, tab_spec, tab_script, tab_result = st.tabs(
+        ["📋 Test Cases", "📄 Test Spec", "💻 Script", "📊 Result"]
+    )
+
+    # ── TAB 1: Test Cases ──
+    with tab_cases:
+        if cases:
+            st.markdown("#### Test Cases")
+            case_data = []
+            for case in cases:
+                case_data.append({
+                    "Name": f"`{case.get('name', '?')}`",
+                    "Input": f"`{case.get('input', '?')}`",
+                    "Expected": f"`{case.get('expected', '?')}`",
+                    "Category": case.get("category", "?"),
+                    "Status": "✅" if pytest_result.get("status") == "passed" else "❌",
+                })
+            st.dataframe(case_data, use_container_width=True)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button(
+                    "📥 Download Cases (JSON)",
+                    data=json.dumps(cases, indent=2),
+                    file_name=f"{task}_cases.json",
+                    mime="application/json",
+                    key=f"dl_cases_{agent}",
+                )
+            with col2:
+                st.code(json.dumps(cases, indent=2), language="json")
+        else:
+            st.info("ℹ️ No test cases available yet.")
+
+    # ── TAB 2: Test Spec ──
+    with tab_spec:
+        if spec:
+            st.markdown("#### Test Specification")
+            spec_data = []
+            for key, value in spec.items():
+                if isinstance(value, list):
+                    value = ", ".join(str(v) for v in value)
+                spec_data.append({"Field": key, "Value": value})
+            st.dataframe(spec_data, use_container_width=True)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button(
+                    "📥 Download Spec (JSON)",
+                    data=json.dumps(spec, indent=2),
+                    file_name=f"{task}_spec.json",
+                    mime="application/json",
+                    key=f"dl_spec_{agent}",
+                )
+            with col2:
+                st.code(json.dumps(spec, indent=2), language="json")
+        else:
+            st.info("ℹ️ No spec available yet.")
+
+    # ── TAB 3: Script ──
+    with tab_script:
+        if script:
+            st.markdown("#### Python Test Script")
+            st.code(script, language="python")
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.download_button(
+                    "💾 Download (.py)",
+                    data=script,
+                    file_name=f"{task}_test.py",
+                    mime="text/x-python",
+                    key=f"dl_script_{agent}",
+                )
+            with col2:
+                st.button("▶️ Run Test", key=f"run_{agent}")
+            with col3:
+                st.button("📋 Copy Code", key=f"copy_{agent}")
+        else:
+            st.info("ℹ️ No script generated yet.")
+
+    # ── TAB 4: Result ──
+    with tab_result:
+        # Show error banner and retry button if status is ERROR
+        if status == "error":
+            error_msg = data.get("generation_error") or data.get("error") or "Unknown error occurred"
+            st.error(f"❌ **Test Execution Failed**\n\n{error_msg}")
+            
+            # Retry button
+            if st.button("🔄 Retry: Let Master Fix & Re-run", key=f"retry_{agent}", use_container_width=True):
+                repo_path = st.session_state.get("repository_path", "")
+                source_context = st.session_state.get("source_context", "")
+                client = st.session_state.get("vio_client")
+                
+                # If source_context not in session, compute it now
+                if not source_context and repo_path:
+                    source_context, _ = gather_source_context(repo_path, max_chars=8000)
+                
+                if not client or not repo_path:
+                    st.error("❌ Cannot retry: missing client or repo path.")
+                else:
+                    try:
+                        with st.spinner(f"🧠 Master is analyzing and fixing {agent}... This may take a minute."):
+                            # Get the task type
+                            task_type = data.get("task_type", "unit_test")
+                            task_id = f"{task_type}_0"
+                            
+                            # Call master to fix the code with timeout protection
+                            try:
+                                fix_result = client.fix_test(script, error_msg, source_context)
+                            except TimeoutError as te:
+                                st.error(f"❌ Fix request timed out: {str(te)}")
+                                st.info("💡 Try again or check VIO connectivity.")
+                                return
+                            except Exception as fix_exc:
+                                st.error(f"❌ Error calling master: {type(fix_exc).__name__}: {str(fix_exc)}")
+                                return
+                            
+                            if not fix_result:
+                                st.error("❌ Master returned empty response.")
+                                return
+                                
+                            if not fix_result.get("ok"):
+                                st.warning(f"⚠️ Master couldn't fix the test: {fix_result.get('error', 'Unknown error')}")
+                                return
+                            
+                            # Extract the fixed code
+                            fixed_code = extract_python_code(fix_result["content"])
+                            if not fixed_code or "def test" not in fixed_code:
+                                st.error("❌ Master's fix didn't produce valid Python code. Please review the prompt or try another approach.")
+                                return
+                            
+                            # Save the fixed code
+                            test_file = Path(repo_path) / "tests" / "test_scripts" / f"{task_id}_test.py"
+                            test_file.parent.mkdir(parents=True, exist_ok=True)
+                            test_file.write_text(fixed_code, encoding="utf-8")
+                            
+                            # Re-run pytest using repo's venv
+                            venv_python, _ = get_venv_python(repo_path)
+                            pytest_result = run_pytest(test_file, Path(repo_path), venv_python=venv_python)
+                            
+                            # Update session state with results
+                            data["script"] = fixed_code
+                            data["code"] = fixed_code
+                            data["pytest_result"] = pytest_result
+                            data["passed"] = pytest_result.get("passed", 0)
+                            data["failed"] = pytest_result.get("failed", 0)
+                            data["errors"] = pytest_result.get("errors", 0)
+                            data["status"] = "done" if pytest_result.get("passed", 0) > 0 and (pytest_result.get("failed", 0) + pytest_result.get("errors", 0)) == 0 else "error"
+                            data["fix_applied"] = True
+                            
+                            st.session_state["models"][agent] = data
+                            st.success(f"✅ Master fixed the test! Status: {data['status'].upper()}")
+                            st.rerun()
+                    
+                    except Exception as exc:
+                        logger.exception("Unexpected error in retry handler")
+                        st.error(f"❌ Unexpected error during retry: {type(exc).__name__}: {str(exc)}")
+            
+            st.markdown("---")
+        
+        if pytest_result and pytest_result.get("logs"):
+            st.markdown("#### Test Execution Result")
+            
+            # Summary metrics
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Status", "✅ Passed" if pytest_result.get("status") == "passed" else "❌ Failed")
+            col2.metric("Passed", pytest_result.get("passed", 0))
+            col3.metric("Failed", pytest_result.get("failed", 0))
+            col4.metric("Duration", f"{pytest_result.get('duration', 0):.2f}s")
+            
+            st.markdown("---")
+            
+            # Show if fix was applied
+            if data.get("fix_applied"):
+                st.info("ℹ️ This test was auto-fixed by the master agent after an initial failure.")
+            
+            # Pytest output
+            st.markdown("**Pytest Summary**")
+            st.code(pytest_result.get("summary", "No summary available"), language="text")
+            
+            # Failures
+            if pytest_result.get("failures"):
+                with st.expander("❌ View Failures", expanded=False):
+                    for failure in pytest_result["failures"]:
+                        st.error(f"**{failure['test']}**\n{failure['error']}")
+            
+            # Full logs
+            with st.expander("📋 Full Pytest Output", expanded=False):
+                st.code(pytest_result.get("logs", ""), language="text")
+            
+            # Download result as README
             st.download_button(
-                "⬇️ Download README",
-                data=readme,
-                file_name=f"{task}_README.md",
+                "📥 Download Result (README.md)",
+                data=_build_test_readme(
+                    agent, AGENT_MODELS.get(agent, agent), task, 
+                    cases, spec, script, pytest_result, validation_level
+                ),
+                file_name=f"{task}_result_README.md",
                 mime="text/markdown",
-                key=f"dl_readme_{agent}",
-            )
-            if data.get("readme_path"):
-                st.caption(f"Saved to `{data['readme_path']}`")
-        else:
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Passed", passed)
-            m2.metric("Failed", failed)
-            m3.metric("Errors", errors)
-            st.info("The per-agent README will appear here after pytest completes.")
-
-    with prompt_tab:
-        prompt = data.get("prompt", "")
-        if prompt:
-            st.code(prompt, language="text")
-            st.download_button(
-                "⬇️ Download Prompt",
-                data=prompt,
-                file_name=f"{task}_prompt.md",
-                mime="text/markdown",
-                key=f"dl_prompt_{agent}",
+                key=f"dl_result_{agent}",
             )
         else:
-            if "results" in data:
-                st.info("This earlier run did not capture its prompt. Rerun the agent to save and view the exact prompt.")
-            else:
-                st.info("The generated prompt will appear here when the agent response is available.")
-
-    with script_tab:
-        code = data.get("code", "")
-        if code:
-            st.code(code, language="python")
-            st.download_button(
-                "⬇️ Download Script",
-                data=code,
-                file_name=f"{task}_test.py",
-                mime="text/x-python",
-                key=f"dl_script_{agent}",
-            )
-        else:
-            st.info("The generated test script will appear here when the agent returns code.")
+            if status != "error":
+                st.info("ℹ️ Test execution result will appear here after pytest runs.")
 
 
 
@@ -2154,8 +2524,8 @@ def _failure_analysis(test_result: dict) -> tuple[str, str]:
         )
     if "modulenotfounderror" in lowered or "importerror" in lowered:
         return (
-            "Python could not import a module or symbol required by the generated test.",
-            "Verify the symbol exists in this repository version, correct the import root/name, and install the target repository's declared dependencies before rerunning.",
+            "❌ Missing import: Python could not import a module required by the test. This often happens when the target repository's dependencies are not installed.",
+            "**First step:** Click the '📦 Install Repo Dependencies' button to install the target repo's package and dependencies. Then regenerate tests.",
         )
     if "attributeerror" in lowered:
         return (
@@ -2169,12 +2539,12 @@ def _failure_analysis(test_result: dict) -> tuple[str, str]:
         )
     if reason:
         return (
-            f"Pytest reported: `{reason}`. This concise reason alone does not establish a deeper cause; use the captured traceback below.",
-            "Follow the first relevant traceback frame into the repository or generated fixture, correct the mismatched assumption, and rerun this test before the full suite.",
+            f"Pytest reported: `{reason}`. This error may indicate missing dependencies or an issue with the environment.",
+            "**Try first:** Install repo dependencies (📦 button), then regenerate. If the issue persists, review the traceback below for specific details.",
         )
     return (
-        "Pytest marked this test as failed, but did not provide a concise parsed reason. See the full captured pytest output below.",
-        "Use the traceback and assertion diff in the captured output to correct the test setup or expectation, then rerun the affected script.",
+        "Pytest marked this test as failed. This often indicates missing imports or environment issues.",
+        "**Try first:** Install repo dependencies (📦 button), then regenerate tests. If the issue persists, see the full pytest output below.",
     )
 
 
@@ -2323,86 +2693,227 @@ def _vio_process_task(client, repo_path, source_context, task_type, status_cb=No
     task_id = f"{task_type}_0"
     result = {"status": "generating", "task_type": task_type, "tokens": 0, "time_s": 0.0}
 
-    _report("generating")
-    prompt = create_task_prompt(task_type, repo_path)
-    result["prompt"] = prompt
-    prompt_path = Path(repo_path) / "tests" / "orchestration_results" / f"{task_id}_prompt.md"
-    prompt_path.parent.mkdir(parents=True, exist_ok=True)
-    prompt_path.write_text(prompt, encoding="utf-8")
-    result["prompt_path"] = str(prompt_path)
-    res = client.generate_test(agent, prompt)
-    if not res["ok"]:
+    try:
+        _report("generating")
+        prompt = create_task_prompt(task_type, repo_path)
+        result["prompt"] = prompt
+        prompt_path = Path(repo_path) / "tests" / "orchestration_results" / f"{task_id}_prompt.md"
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_path.write_text(prompt, encoding="utf-8")
+        result["prompt_path"] = str(prompt_path)
+        
+        res = client.generate_test(agent, prompt)
+        if not res["ok"]:
+            result.update(
+                status="error",
+                agent=agent,
+                validation={"level": "-", "reasons": res["error"]},
+                generation_error=res["error"],
+                results=[],
+                passed=0,
+                failed=0,
+                errors=1,
+            )
+            _write_agent_readme(repo_path, task_id, result)
+            _report("error")
+            return agent, result
+
+        code = extract_python_code(res["content"])
+        elapsed = res["time_s"]
+        save_orchestration_result(repo_path, task_id, res["content"])
+        script_path = str(Path(repo_path) / "tests" / "test_scripts" / f"{task_id}_test.py")
+        
+        # Parse worker output to extract cases, spec, script (NEW: also test_data and test_display)
+        worker_data = parse_worker_output(res["content"])
+        cases = worker_data.get("cases", [])
+        spec = worker_data.get("spec", {})
+        
+        # If cases/spec weren't in structured format, extract them from generated code
+        if not cases and code:
+            cases = extract_test_cases_from_code(code)
+            logger.debug(f"Extracted {len(cases)} test cases from generated code")
+        
+        if not spec and code:
+            spec = extract_test_spec_from_code(code, task_type)
+            logger.debug(f"Generated test spec with {len(spec.get('imports_used', []))} imports")
+        
+        if not code and worker_data.get("script"):
+            code = worker_data.get("script")
+
+        # Log what we got from the agent for debugging
+        logger.debug(f"Agent response length: {len(res['content'])} chars")
+        logger.debug(f"Code extracted: {len(code) if code else 0} chars")
+        logger.debug(f"Worker data keys: {list(worker_data.keys())}")
+        logger.debug(f"Has test_data: {'test_data' in worker_data}")
+        logger.debug(f"Has test_display: {'test_display' in worker_data}")
+        
+        # Validate we have code before proceeding
+        if not code or not code.strip():
+            logger.error(
+                f"❌ {agent} failed to produce code. Response length: {len(res['content'])}, "
+                f"Code: {len(code) if code else 0} chars, "
+                f"Worker script: {len(worker_data.get('script', '')) if worker_data.get('script') else 0} chars"
+            )
+            logger.error(f"Agent response (first 1000 chars):\n{res['content'][:1000]}")
+            result.update(
+                status="error",
+                agent=agent,
+                validation={"level": "-", "reasons": "No valid Python code extracted from model response"},
+                generation_error="Failed to extract Python code from model output",
+                results=[],
+                passed=0,
+                failed=0,
+                errors=1,
+                cases=cases,
+                spec=spec,
+            )
+            _write_agent_readme(repo_path, task_id, result)
+            _report("error")
+            return agent, result
+
+        # Validate Python syntax before running tests
+        is_valid, syntax_error = validate_python_code(code)
+        if not is_valid:
+            logger.error(f"❌ Generated code has syntax errors: {syntax_error}")
+            result.update(
+                status="error",
+                agent=agent,
+                validation={"level": "-", "reasons": f"Generated code has syntax errors: {syntax_error}"},
+                generation_error=f"Python syntax error in generated code:\n{syntax_error}",
+                results=[],
+                passed=0,
+                failed=0,
+                errors=1,
+                cases=cases,
+                spec=spec,
+            )
+            _write_agent_readme(repo_path, task_id, result)
+            _report("error")
+            return agent, result
+
+        _report("validating")
+        verdict = client.validate(code, source_context)
+
+        _report("testing")
+        # Save the test script to disk
+        test_file = save_test_script(code, Path(repo_path), task_type)
+        # Run pytest using the repo's virtual environment
+        venv_python, venv_ok = get_venv_python(repo_path)
+        
+        # Validate venv Python exists and is executable
+        if not venv_python or not Path(venv_python).exists():
+            logger.error(f"⚠️ venv Python not found at: {venv_python}")
+            result.update(
+                status="error",
+                agent=agent,
+                validation={"level": "-", "reasons": f"Virtual environment Python not found at {venv_python}. Ensure dependencies are installed."},
+                generation_error="Virtual environment setup failed",
+                results=[],
+                passed=0,
+                failed=0,
+                errors=1,
+            )
+            _write_agent_readme(repo_path, task_id, result)
+            _report("error")
+            return agent, result
+        
+        logger.info(f"Using venv Python: {venv_python}")
+        pytest_result = run_pytest(test_file, Path(repo_path), venv_python=venv_python)
+        
+        # Log the actual test results
+        logger.info(
+            f"Test Results: {pytest_result['passed']} passed, "
+            f"{pytest_result['failed']} failed, "
+            f"{pytest_result['errors']} errors | Status: {pytest_result['status']}"
+        )
+        
+        # Save both agent output and pytest result to separate JSON files
+        logger.debug(f"Saving agent output and pytest result...")
+        try:
+            save_agent_output(worker_data, Path(repo_path), task_type, task_index=0)
+            save_test_result(pytest_result, Path(repo_path), task_type, task_index=0)
+            logger.debug(f"✅ Saved {task_type}_0_output.json and {task_type}_0_result.json")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to save JSON results: {e}")
+        
+        test_attempts = [{"label": "Initial pytest run", "output": pytest_result["logs"]}]
+        fix_attempted = False
+        fix_error = ""
+
+        # One fix round if needed
+        if pytest_result["failed"] + pytest_result["errors"] > 0:
+            fix_attempted = True
+            _report("fixing")
+            fix = client.fix_test(code, pytest_result["logs"], source_context)
+            if fix["ok"]:
+                fixed = extract_python_code(fix["content"])
+                if fixed and "def test" in fixed:
+                    code = fixed
+                    # Save and re-run fixed version with repo's venv
+                    test_file.write_text(code, encoding="utf-8")
+                    pytest_result = run_pytest(test_file, Path(repo_path), venv_python=venv_python)
+                    # Log retried test results
+                    logger.info(
+                        f"After auto-fix - Test Results: {pytest_result['passed']} passed, "
+                        f"{pytest_result['failed']} failed, "
+                        f"{pytest_result['errors']} errors | Status: {pytest_result['status']}"
+                    )
+                    test_attempts.append({"label": "Pytest after auto-fix", "output": pytest_result["logs"]})
+                    elapsed += fix["time_s"]
+            else:
+                fix_error = fix.get("error", "VIO did not return a corrected test.")
+        
+        all_pass = pytest_result["passed"] > 0 and pytest_result["failed"] + pytest_result["errors"] == 0
+        final_status = "done" if all_pass or pytest_result["passed"] > 0 else "error"
+        result.update(
+            status=final_status,
+            agent=agent,
+            code=code,
+            script=code,
+            cases=cases,
+            spec=spec,
+            # NEW: Store test_data and test_display for frontend
+            test_data=worker_data.get("test_data", {"cases": cases, "spec": spec, "script": code}),
+            test_display=worker_data.get("test_display", {}),
+            prompt=prompt,
+            prompt_path=str(prompt_path),
+            script_path=str(test_file),
+            validation=verdict,
+            pytest_result=pytest_result,
+            test_attempts=test_attempts,
+            fix_attempted=fix_attempted,
+            fix_applied=bool(fix_attempted and len(test_attempts) > 1),
+            fix_error=fix_error,
+            tokens=client.token_usage.get(agent, 0),
+            time_s=elapsed,
+            passed=pytest_result["passed"],
+            failed=pytest_result["failed"],
+            errors=pytest_result["errors"],
+        )
+        _write_agent_readme(repo_path, task_id, result)
+        _report(final_status)
+        return agent, result
+        
+    except Exception as exc:
+        # Catch any unhandled exception and report it as an error
+        logger.exception("Unhandled exception in _vio_process_task for %s", task_type)
+        error_msg = f"{type(exc).__name__}: {str(exc)}"
         result.update(
             status="error",
             agent=agent,
-            validation={"level": "-", "reasons": res["error"]},
-            generation_error=res["error"],
+            validation={"level": "-", "reasons": error_msg},
+            generation_error=error_msg,
             results=[],
             passed=0,
             failed=0,
             errors=1,
         )
-        _write_agent_readme(repo_path, task_id, result)
+        try:
+            _write_agent_readme(repo_path, task_id, result)
+        except Exception:
+            pass
         _report("error")
         return agent, result
-
-    code = extract_python_code(res["content"])
-    elapsed = res["time_s"]
-    save_orchestration_result(repo_path, task_id, res["content"])
-    script_path = str(Path(repo_path) / "tests" / "test_scripts" / f"{task_id}_test.py")
-
-    _report("validating")
-    verdict = client.validate(code, source_context)
-
-    _report("testing")
-    pyres = run_pytest_single(repo_path, f"{task_id}_test.py")
-    test_attempts = [{"label": "Initial pytest run", "output": pyres["output"]}]
-    fix_attempted = False
-    fix_error = ""
-
-    # One fix round if needed
-    if pyres["failed"] + pyres["errors"] > 0:
-        fix_attempted = True
-        _report("fixing")
-        fix = client.fix_test(code, pyres["output"], source_context)
-        if fix["ok"]:
-            fixed = extract_python_code(fix["content"])
-            if fixed and "def test" in fixed:
-                scripts_dir = Path(repo_path) / "tests" / "test_scripts"
-                (scripts_dir / f"{task_id}_test.py").write_text(
-                    "# VIO auto-fixed\n" + fixed + "\n", encoding="utf-8")
-                code = fixed
-                pyres = run_pytest_single(repo_path, f"{task_id}_test.py")
-                test_attempts.append({"label": "Pytest after auto-fix", "output": pyres["output"]})
-                elapsed += fix["time_s"]
-        else:
-            fix_error = fix.get("error", "VIO did not return a corrected test.")
-    results = parse_pytest_output(pyres["output"])
-    all_pass = pyres["passed"] > 0 and pyres["failed"] + pyres["errors"] == 0
-    final_status = "done" if all_pass or pyres["passed"] > 0 else "error"
-    result.update(
-        status=final_status,
-        agent=agent,
-        code=code,
-        prompt=prompt,
-        prompt_path=str(prompt_path),
-        script_path=script_path,
-        validation=verdict,
-        results=results,
-        test_output=pyres["output"],
-        test_attempts=test_attempts,
-        fix_attempted=fix_attempted,
-        fix_applied=bool(fix_attempted and len(test_attempts) > 1),
-        fix_error=fix_error,
-        tokens=client.token_usage.get(agent, 0),
-        time_s=elapsed,
-        passed=pyres["passed"],
-        failed=pyres["failed"],
-        errors=pyres["errors"],
-    )
-    _write_agent_readme(repo_path, task_id, result)
-    _report(final_status)
-    return agent, result
 
 
 def _vio_background_run(
@@ -2432,6 +2943,20 @@ def _vio_background_run(
         scripts_dir = Path(repo_path) / "tests" / "test_scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
         _write_vio_conftest(repo_path)
+
+        # Auto-install repository dependencies before test generation
+        # This ensures generated tests can import the target package
+        logger.info("Installing repository dependencies for test execution...")
+        try:
+            dep_result = install_repo_dependencies(repo_path)
+            if dep_result["success"]:
+                logger.info("✅ Dependencies installed: " + dep_result["message"])
+            else:
+                logger.warning("⚠️ Dependency installation issue: " + dep_result["message"])
+                if dep_result.get("output"):
+                    logger.debug("Installation output: " + dep_result["output"][:500])
+        except Exception as exc:
+            logger.warning(f"Dependency installation failed (tests may still run): {exc}")
 
         def work(task_type):
             agent = TYPE_TO_AGENT.get(task_type, AGENTS["unit"])
@@ -2472,6 +2997,7 @@ def _vio_background_run(
 
         summary_lines = [
             f"- {agent} ({result.get('task_type', '')}): "
+            f"status={result.get('status', '?')}, "
             f"{result.get('passed', 0)} passed, {result.get('failed', 0)} failed, "
             f"{result.get('errors', 0)} errors; "
             f"validation={result.get('validation', {}).get('level', '?')}"
@@ -2709,7 +3235,8 @@ def render_vio_workspace() -> None:
 
     if connect:
         with st.spinner("Pinging VIO..."):
-            client = VIOClient(base_url=endpoint)
+            # Use 120s timeout for complex repos; master agent may take time to validate/fix
+            client = VIOClient(base_url=endpoint, timeout=120)
             if not client.is_configured:
                 st.session_state["vio_connected"] = False
                 st.error("VIO_API_KEY missing. Add it to your .env file, then reconnect.")
@@ -2854,38 +3381,6 @@ def main() -> None:
 
     # Display repository information status
     st.markdown("### Repository information")
-    details = st.columns(4)
-    run_state = st.session_state.get("vio_run_state", {})
-    if run_state.get("active"):
-        st.warning("VIO generation is already running.")
-        return
-
-    models_state = {
-        TYPE_TO_AGENT.get(task_type, AGENTS["unit"]): {
-            "status": "queued",
-            "task_type": task_type,
-            "tokens": 0,
-        }
-        for task_type in selected_types
-    }
-    models_state.setdefault(
-        AGENTS["master"], {"status": "idle", "task_type": "supervision", "tokens": 0}
-    )
-    run_state = {"active": True, "finished": False, "report": "", "error": ""}
-    st.session_state["models"] = models_state
-    st.session_state["vio_run_state"] = run_state
-    if not st.session_state.get("selected_model"):
-        st.session_state["selected_model"] = TYPE_TO_AGENT.get(
-            selected_types[0], AGENTS["unit"]
-        )
-
-    worker = threading.Thread(
-        target=_vio_background_run,
-        args=(client, repo_path, selected_types.copy(), parallel, models_state, run_state),
-        name="vio-test-generation",
-        daemon=True,
-    )
-    worker.start()
 
 
 @st.fragment(run_every=1)
