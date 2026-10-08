@@ -77,7 +77,7 @@ class VIOClient:
         self,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
-        timeout: int = 30,
+        timeout: int = 120,
     ):
         self.base_url = (base_url or os.getenv("VIO_API_BASE", "")).rstrip("/")
         self.api_key = api_key or os.getenv("VIO_API_KEY", "")
