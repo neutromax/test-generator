@@ -1,10 +1,10 @@
 """
-Streamlit UI for the repository-specific Copilot test prompt generator.
+Streamlit UI for the repository test generator.
 
 This application provides a web-based interface for:
 - Cloning GitHub repositories
 - Generating test prompts from repository structure
-- Automating clipboard copy and VS Code integration
+- Automating clipboard copy
 - Managing test result collection and packaging
 - Displaying generated test artifacts (specs, scripts, coverage)
 - ORCHESTRATOR: Master-Worker intelligent test generation with Ollama models
@@ -13,14 +13,17 @@ This application provides a web-based interface for:
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import json
 import subprocess
+import sys
 import time
 import zipfile
 import logging
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
@@ -32,6 +35,12 @@ import pandas as pd
 
 # Import the copilot_bridge module for automation functions
 from src import copilot_bridge
+from src import chat_assistant
+from src import coverage_view
+from src import results_view
+from src import run_history
+from src import run_progress
+from src import side_by_side
 
 from src.generate_test_prompt import (
     TOOL_DIR,
@@ -47,8 +56,29 @@ from src.orchestrator.cache_manager import CacheManager
 from src.orchestrator.model_selector import ModelSelector
 from src.orchestrator.master_supervisor import MasterSupervisor
 from src.orchestrator.task_router import TaskRouter, TaskType, TaskStatus
+from src.orchestrator.spec_pipeline import (
+    COVERAGE_TARGET,
+    SPEC_MARKER_PREFIXES,
+    coverage_env,
+    coverage_options,
+    discover_components,
+    describe_failure,
+    generate_suite,
+    measure_coverage,
+    preflight_components,
+    process_component,
+    raise_coverage,
+    render_coverage_markdown,
+    rerun_component,
+    select_components,
+    spec_slugs,
+    summarize_coverage,
+    top_up_component,
+    write_test_support,
+)
 
 # VIO (Aumovio online agents) + environment loading
+from src.vio_client import VIOClient, VIOGenerationAdapter, AGENTS, AGENT_MODELS, TYPE_TO_AGENT
 from src.vio_client import VIOClient, AGENTS, AGENT_MODELS, TYPE_TO_AGENT
 from src.test_runner import run_pytest, save_test_script, parse_worker_output, save_agent_output, save_test_result, validate_python_code, extract_test_cases_from_code, extract_test_spec_from_code
 
@@ -70,6 +100,7 @@ logger = logging.getLogger(__name__)
 
 
 REPOSITORIES_DIR = TOOL_DIR / "repositories"
+VIEW_CHAT, VIEW_RESULTS, VIEW_ADVANCED = "💬 Chat", "📊 Results", "⚙️ Advanced"
 
 
 def validate_repository_url(repository_url: str) -> tuple[bool, str]:
@@ -117,7 +148,7 @@ def initialize_state() -> None:
         "dep_install_result": None,  # pip install result for repo dependencies
         "self_correct_result": None,  # self-correction loop summary
         # --- Dual-mode (VIO / Ollama) UI state ---
-        "mode": None,  # None (gate) | "vio" | "ollama"
+        "mode": None,  # None (landing page) | "app"
         "theme": "dark",  # "dark" | "light"
         "vio_endpoint": os.getenv("VIO_API_BASE", "https://vio.automotive-wan.com:446"),
         "vio_client": None,  # VIOClient instance
@@ -319,7 +350,91 @@ def display_orchestrator_section() -> None:
         display_orchestration_results()
 
 
-def run_test_orchestration(selected_types: List[str]) -> None:
+def run_test_orchestration(selected_types: List[str], components=None, inline_extras: bool = True) -> None:
+    """Generate and execute one matching script for each component specification."""
+    repo_path = st.session_state["repository_path"]
+    client = st.session_state["ollama_client"]
+    selector = st.session_state["model_selector"]
+    model = selector.select_model(selected_types[0])
+    if not model:
+        st.error("No suitable installed Ollama model is available.")
+        return
+    scripts = Path(repo_path) / "tests" / "test_scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    write_test_support(repo_path)
+    results = {}
+    st.session_state["execution_results"] = results
+    st.session_state["orchestration_exec_result"] = None
+    with st.status("Planning and testing repository components", expanded=True) as progress:
+        st.write("Checking that repository modules import...")
+        components, import_failures = preflight_components(
+            repo_path, discover_components(repo_path) if components is None else components)
+        for failure in import_failures:
+            results[failure["component"]] = failure
+            st.write(f"{failure['component']}: FAILED")
+            st.warning(failure["error"])
+        for result in generate_suite(
+            repo_path, selected_types, client, model, extract_python_code, run_pytest_single,
+            progress=lambda name: st.write(f"Working on {name}..."), components=components,
+        ):
+            task_id = Path(result["spec"]).stem if result.get("spec") else result["component"]
+            results[task_id] = result
+            st.write(f"{result['component']}: {result['status']}")
+            if result.get("error"):
+                st.warning(result["error"])
+        failed = sum(result["status"] == "FAILED" for result in results.values())
+        progress.update(label=f"{len(results)} components processed; {failed} coverage gaps", state="error" if failed else "complete")
+    components = discover_components(repo_path)
+    with st.spinner(f"Measuring source coverage and raising it to {COVERAGE_TARGET:g}%..."):
+        def top_up(component, row):
+            previous = next((r for r in results.values() if r["component"] == row["component"]), None)
+            updated = top_up_component(
+                repo_path, component, row, previous, selected_types, client, model,
+                extract_python_code, run_pytest_single, engine="ollama")
+            if updated and updated.get("component"):
+                for key in [k for k, r in results.items() if r["component"] == updated["component"]]:
+                    del results[key]
+                results[Path(updated["spec"]).stem if updated.get("spec") else updated["component"]] = updated
+            return updated
+
+        coverage = raise_coverage(
+            repo_path, components,
+            measure_coverage(repo_path, components, results=list(results.values())), top_up,
+            measure=lambda path, found: measure_coverage(path, found, results=list(results.values())),
+            exclude={r["component"] for r in results.values() if r.get("script") and r.get("status") != "COMPLETED"})
+    st.session_state["last_coverage"] = coverage
+    report = Path(repo_path) / "tests" / "spec_traceability.json"
+    report.write_text(json.dumps(list(results.values()), indent=2, default=str), encoding="utf-8")
+    if inline_extras:
+        st.download_button("Download specification traceability", data=report.read_text(encoding="utf-8"),
+                           file_name=report.name, mime="application/json")
+    if inline_extras:
+        render_coverage_panel(coverage)
+
+
+def render_coverage_panel(coverage: dict) -> None:
+    """Show overall and per-component source coverage so the next batch of specs can target gaps."""
+    if not coverage:
+        return
+    if coverage.get("error"):
+        st.warning(f"Source coverage unavailable: {coverage['error']}")
+        return
+    st.markdown("#### Source Coverage")
+    st.metric("Line + branch coverage", f"{coverage['percent']}%")
+    if "target" in coverage:
+        met = coverage["target_met"]
+        (st.success if met else st.warning)(
+            f"Target {coverage['target']:g}% {'met' if met else 'not met'} after {coverage.get('rounds', 0)} top-up round(s).")
+    st.caption("Lowest coverage first. Components without a specification are the candidates for the next batch.")
+    st.dataframe(
+        [{"Component": row["component"], "Specified": "Yes" if row["specified"] else "No",
+          "Coverage %": row["percent"], "Uncovered lines": row["uncovered_lines"]}
+         for row in coverage["components"]],
+        use_container_width=True, hide_index=True,
+    )
+
+
+def _legacy_run_test_orchestration(selected_types: List[str]) -> None:
     """
     Execute the test orchestration workflow.
     
@@ -931,6 +1046,91 @@ def display_orchestration_results() -> None:
     st.markdown("### 📊 Orchestration Results")
     
     results = st.session_state["execution_results"]
+    aligned = [
+        result for result in results.values()
+        if result.get("spec") and result.get("script")
+    ]
+    if aligned:
+        st.markdown("#### 📚 Aligned Specs, Scripts & Pytest Results")
+        st.caption(
+            "Every specification has exactly one matching test script and pytest result "
+            "sharing the same numeric prefix and feature name."
+        )
+        for result in aligned:
+            spec_path = Path(result["spec"])
+            script_path = Path(result["script"])
+            if not spec_path.exists():
+                continue
+            stem = spec_path.stem
+            with st.expander(f"📦 {stem}", expanded=False):
+                spec_content = spec_path.read_text(encoding="utf-8")
+                st.markdown("**Specification**")
+                st.markdown(spec_content)
+                st.download_button(
+                    "⬇️ Download specification",
+                    data=spec_content,
+                    file_name=spec_path.name,
+                    mime="text/markdown",
+                    key=f"dl_spec_{stem}",
+                )
+                if script_path.exists():
+                    script_content = script_path.read_text(encoding="utf-8")
+                    st.markdown(f"**Test script** — `{script_path.name}`")
+                    st.code(script_content, language="python")
+                    st.download_button(
+                        "⬇️ Download test script",
+                        data=script_content,
+                        file_name=script_path.name,
+                        mime="text/x-python",
+                        key=f"dl_script_{stem}",
+                    )
+                pytest_output = (result.get("execution") or {}).get("output", "")
+                if pytest_output:
+                    st.markdown("**Pytest result**")
+                    st.code(pytest_output, language="text")
+                    st.download_button(
+                        "⬇️ Download pytest output",
+                        data=pytest_output,
+                        file_name=f"{stem}_pytest.txt",
+                        mime="text/plain",
+                        key=f"dl_pytest_{stem}",
+                    )
+
+        # Aligned bundle: specs + matching scripts + pytest results in one ZIP
+        bundle = io.BytesIO()
+        with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:
+            for result in aligned:
+                spec_path = Path(result["spec"])
+                if spec_path.exists():
+                    archive.write(spec_path, f"specs/{spec_path.name}")
+                if result.get("script") and Path(result["script"]).exists():
+                    archive.write(result["script"], f"test_scripts/{Path(result['script']).name}")
+                pytest_output = (result.get("execution") or {}).get("output")
+                if pytest_output:
+                    archive.writestr(f"pytest_results/{spec_path.stem}_pytest.txt", pytest_output)
+                if result.get("path") and Path(result["path"]).exists():
+                    archive.write(result["path"], f"orchestration_results/{Path(result['path']).name}")
+        st.download_button(
+            "📦 Download aligned bundle (specs + scripts + pytest results)",
+            data=bundle.getvalue(),
+            file_name=f"{st.session_state.get('repository_name') or 'repository'}_aligned_tests.zip",
+            mime="application/zip",
+            key="dl_aligned_bundle",
+        )
+
+    # Fallback viewer for specifications that have no matching script yet
+    unmatched_specs = [
+        Path(result["spec"]) for result in results.values()
+        if result.get("spec") and not result.get("script")
+    ]
+    if unmatched_specs:
+        selected_spec = st.selectbox("Test specification (no matching script yet)", unmatched_specs,
+                                     format_func=lambda path: path.name)
+        spec_content = selected_spec.read_text(encoding="utf-8")
+        with st.expander("Specification details", expanded=False):
+            st.markdown(spec_content)
+        st.download_button("Download test specification", data=spec_content,
+                           file_name=selected_spec.name, mime="text/markdown")
     
     # Summary stats
     col1, col2, col3 = st.columns(3)
@@ -1037,21 +1237,17 @@ def display_orchestration_results() -> None:
             except Exception:
                 pass
 
-    script_files = sorted(scripts_dir.glob("*_test.py")) if scripts_dir and scripts_dir.exists() else []
+    spec_driven = any(result.get("component") for result in results.values())
+    if spec_driven:
+        script_files = [Path(result["script"]) for result in results.values()
+                        if result.get("script") and Path(result["script"]).is_file()]
+    else:
+        script_files = sorted(scripts_dir.glob("*_test.py")) if scripts_dir and scripts_dir.exists() else []
 
     # Write a conftest.py so pytest can import the repo's package from source.
     if scripts_dir is not None and script_files:
         try:
-            import_root, package = discover_package_import_root(Path(repo_path))
-            conftest = scripts_dir / "conftest.py"
-            conftest.write_text(
-                "import sys\n"
-                "from pathlib import Path\n"
-                f"# Add the repository import root so `{package or 'the package'}` is importable.\n"
-                f"sys.path.insert(0, r\"{import_root}\")\n"
-                f"sys.path.insert(0, r\"{Path(repo_path)}\")\n",
-                encoding="utf-8",
-            )
+            write_test_support(repo_path)
         except Exception:
             pass
 
@@ -1070,7 +1266,17 @@ def display_orchestration_results() -> None:
         with col_b:
             if st.button("▶️ Run Generated Tests (pytest)", key="run_generated_tests"):
                 with st.spinner("Running pytest on generated tests..."):
-                    exec_result = run_tests_and_coverage(repo_path)
+                    if spec_driven:
+                        executions = [run_pytest_single(repo_path, path.name) for path in script_files]
+                        exec_result = {
+                            "tests_passed": sum(item["passed"] for item in executions),
+                            "tests_failed": sum(item["failed"] for item in executions),
+                            "tests_errors": sum(item["errors"] for item in executions),
+                            "output": "\n".join(item["output"] for item in executions),
+                        }
+                        exec_result["tests_run"] = sum(exec_result[key] for key in ("tests_passed", "tests_failed", "tests_errors"))
+                    else:
+                        exec_result = run_tests_and_coverage(repo_path)
                 st.session_state["orchestration_exec_result"] = exec_result
 
         dep_result = st.session_state.get("dep_install_result")
@@ -1147,15 +1353,18 @@ def display_orchestration_results() -> None:
 
 def run_pytest_single(repo_path: str, test_filename: str) -> dict:
     """Run pytest on a single generated test file and return pass/fail counts."""
-    scripts_dir = Path(repo_path) / "tests" / "test_scripts"
+    scripts_dir = Path(repo_path).resolve() / "tests" / "test_scripts"
+    write_test_support(repo_path)
     cmd = [
-        "python", "-m", "pytest", str(scripts_dir / test_filename),
-        f"--confcutdir={scripts_dir}", "--rootdir", str(scripts_dir),
-        "-p", "no:cacheprovider", "--tb=short", "-v",
+        sys.executable, "-m", "pytest", str(scripts_dir / test_filename),
+        "-c", str(scripts_dir / "pytest.ini"), "--rootdir", str(scripts_dir),
+        f"--confcutdir={scripts_dir}", "-p", "no:cacheprovider", "--tb=short", "-v",
     ]
     out = ""
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        # pytest imports an installed copy of the target package before conftest.py can redirect it.
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=str(scripts_dir),
+                              env=coverage_env(repo_path))
         out = (proc.stdout or "") + (proc.stderr or "")
     except Exception as exc:  # pragma: no cover - defensive
         out = f"pytest run error: {exc}"
@@ -1170,6 +1379,7 @@ def run_pytest_single(repo_path: str, test_filename: str) -> dict:
         "passed": passed,
         "failed": failed,
         "errors": errors,
+        "skipped": _count(r"(\d+) skipped"),
         "all_passed": failed == 0 and errors == 0 and passed > 0,
     }
 
@@ -1357,6 +1567,7 @@ def install_repo_dependencies(repo_path: str) -> dict:
 
     # Determine what to install
     if (repo / "pyproject.toml").exists() or (repo / "setup.py").exists():
+        cmd = [sys.executable, "-m", "pip", "install", "-e", ".", "-q"]
         cmd = [venv_python, "-m", "pip", "install", "-e", ".", "-q"]
         install_type = "editable install (pyproject.toml/setup.py)"
     else:
@@ -1368,6 +1579,7 @@ def install_repo_dependencies(repo_path: str) -> dict:
         if req is None:
             result["message"] = "⚠️ No pyproject.toml, setup.py, or requirements.txt found. Tests may fail due to missing imports."
             return result
+        cmd = [sys.executable, "-m", "pip", "install", "-r", str(req), "-q"]
         cmd = [venv_python, "-m", "pip", "install", "-r", str(req), "-q"]
         install_type = f"requirements install ({req.name})"
 
@@ -1429,7 +1641,7 @@ def status_badge(label: str, value: str, icon: str) -> None:
 def render_sidebar() -> None:
     with st.sidebar:
         st.markdown("## Enterprise Test Generator")
-        st.caption("Prepare a repository-specific testing prompt for GitHub Copilot.")
+        st.caption("Generate aligned specs, pytest scripts, and reports for any repository.")
         
         st.divider()
         st.markdown("### Workflow")
@@ -1437,9 +1649,9 @@ def render_sidebar() -> None:
             ("01", "Enter Repository URL"),
             ("02", "Clone Repository"),
             ("03", "Generate Test Prompt"),
-            ("04", "Copy Prompt"),
-            ("05", "Paste into Copilot"),
-            ("06", "Generate Tests"),
+            ("04", "Generate Specs & Scripts"),
+            ("05", "Run Pytest"),
+            ("06", "Download Results"),
         )
         st.markdown(
             "".join(
@@ -1497,6 +1709,42 @@ def generate_repository_prompt(repository_url: str) -> None:
         st.error(f"Permission denied while accessing the repository folder: {error}", icon="🔒")
     except OSError as error:
         st.error(f"Unable to write the generated prompt: {error}", icon="⚠️")
+    except RuntimeError as error:
+        st.error(f"Repository operation failed: {error}", icon="⚠️")
+
+
+def clone_repository_only(repository_url: str) -> None:
+    """Clone a repository and update session state without generating a prompt."""
+    repository_url = repository_url.strip()
+    valid, error_message = validate_repository_url(repository_url)
+    if not valid:
+        st.error(error_message, icon="⚠️")
+        return
+
+    try:
+        name = repository_name(repository_url)
+        target = REPOSITORIES_DIR / name
+        was_cloned = not target.exists()
+        if target.exists() and not is_git_repository(target):
+            raise RuntimeError(
+                f"A non-Git folder already exists at {target}. "
+                "Rename or remove it before continuing."
+            )
+
+        with st.status("Preparing repository", expanded=True) as status:
+            st.write("Cloning repository" if was_cloned else "Using existing clone")
+            repository_path = ensure_repository(repository_url, REPOSITORIES_DIR)
+            st.session_state["repository_name"] = name
+            st.session_state["repository_path"] = str(repository_path)
+            st.session_state["repository_url"] = repository_url
+            st.session_state["clone_status"] = "Cloned successfully" if was_cloned else "Already cloned"
+            status.update(label="Repository ready", state="complete", expanded=False)
+    except ValueError as error:
+        st.error(f"Repository validation failed: {error}", icon="⚠️")
+    except PermissionError as error:
+        st.error(f"Permission denied while accessing the repository folder: {error}", icon="🔒")
+    except OSError as error:
+        st.error(f"Unable to access the repository folder: {error}", icon="⚠️")
     except RuntimeError as error:
         st.error(f"Repository operation failed: {error}", icon="⚠️")
 
@@ -1578,12 +1826,17 @@ def run_tests_and_coverage(repo_path: str) -> dict:
             "--tb=short",
             "-v",
         ]
+        components = discover_components(repo_path)
+        json_path = coverage_dir.resolve() / "coverage.json"
+        json_path.unlink(missing_ok=True)
+        pytest_cmd += coverage_options(components, json_path)
         
         proc = subprocess.run(
             pytest_cmd,
             capture_output=True,
             text=True,
             timeout=300,  # 5 minute timeout
+            env=coverage_env(repo_path),
         )
         
         # Parse output
@@ -1605,13 +1858,20 @@ def run_tests_and_coverage(repo_path: str) -> dict:
         result["success"] = bool(passed_match or failed_match or error_match)
 
         
+        coverage_markdown = "Coverage was not collected (is pytest-cov installed?)."
+        if json_path.is_file():
+            try:
+                coverage_markdown = render_coverage_markdown(
+                    summarize_coverage(repo_path, components, json_path, Path.cwd()))
+            except (OSError, ValueError, KeyError) as exc:
+                coverage_markdown = f"Coverage data could not be read: {exc}"
+
         # Write output to coverage_summary.md
         summary_content = f"""# Test Execution Summary
 
 ## Command
 ```bash
-{' '.join(pytest_cmd)}
-```
+{coverage_markdown}
 
 ## Test Results
 - **Tests Run**: {result['tests_run']}
@@ -1643,8 +1903,7 @@ def display_approval_gate() -> None:
     Display the approval gate UI with Proceed/Reject buttons.
     
     When user clicks Proceed:
-    - Copies prompt to system clipboard using copilot_bridge
-    - Opens Test_Prompt.md in VS Code automatically
+    - Copies prompt to system clipboard
     - Creates test folder structure for results collection
     - Shows next steps guidance
     
@@ -1659,7 +1918,7 @@ def display_approval_gate() -> None:
     st.markdown("### ✅ Approval Gate")
     st.markdown(
         "Review the generated prompt above. Click **Proceed** to copy to clipboard and start "
-        "the Copilot Chat workflow, or **Reject** to modify your inputs."
+        "the test generation workflow, or **Reject** to modify your inputs."
     )
     
     # Display approval buttons side by side
@@ -1667,10 +1926,9 @@ def display_approval_gate() -> None:
     
     with col1:
         if st.button("✅ Proceed", type="primary", use_container_width=True):
-            # Proceed workflow: copy to clipboard, open file, create folders
+            # Proceed workflow: copy to clipboard and create folders
             prompt_text = st.session_state["generated_prompt"]
             repo_path = st.session_state["repository_path"]
-            prompt_path = st.session_state["prompt_path"]
             
             # Step 1: Copy prompt to clipboard
             clipboard_success = copilot_bridge.copy_to_clipboard(prompt_text)
@@ -1679,15 +1937,7 @@ def display_approval_gate() -> None:
                     "⚠️ Couldn't copy to clipboard. Please copy manually from the prompt above."
                 )
             
-            # Step 2: Open Test_Prompt.md in VS Code
-            vscode_success = copilot_bridge.open_in_vscode(prompt_path)
-            if not vscode_success:
-                st.warning(
-                    f"⚠️ Couldn't open VS Code automatically. "
-                    f"Please open this file manually: {prompt_path}"
-                )
-            
-            # Step 3: Create test folder structure
+            # Step 2: Create test folder structure
             folders_success = copilot_bridge.create_test_folders(repo_path)
             if not folders_success:
                 st.error("❌ Failed to create test folders. Check permissions and try again.")
@@ -1726,7 +1976,7 @@ def display_results_section() -> None:
     st.markdown("---")
     st.markdown("### 🔄 Load Test Results")
     st.markdown(
-        "After you've completed the Copilot Chat workflow and saved files to the tests/ folder, "
+        "After test generation has saved files to the tests/ folder, "
         "click below to load and display the results."
     )
     
@@ -1749,7 +1999,7 @@ def display_results_section() -> None:
                 st.success(f"✅ Loaded {total_files} files from tests/ folder")
             else:
                 st.info(
-                    "ℹ️ No files found yet. Save your Copilot output in the tests/ folder "
+                    "ℹ️ No files found yet. Save generated output in the tests/ folder "
                     "and click Load Results again."
                 )
     
@@ -1995,29 +2245,53 @@ def aumovio_css(theme: str = "dark") -> str:
     /* Buttons -> Aumovio orange */
     .stButton > button {{ background:{orange}; color:#fff; border:0; border-radius:10px; font-weight:700; }}
     .stButton > button:hover {{ background:{orange_hover}; color:#fff; }}
+    .stApp .st-key-vio_clone_only [data-testid="stButton"] > button,
+    .stApp .st-key-vio_preview_queue [data-testid="stButton"] > button {{
+        background:{orange} !important; color:#fff !important; border:0 !important;
+    }}
+    .stApp .st-key-vio_clone_only [data-testid="stButton"] > button:hover,
+    .stApp .st-key-vio_preview_queue [data-testid="stButton"] > button:hover {{
+        background:{orange_hover} !important; color:#fff !important;
+    }}
+    .stApp .st-key-vio_clone_only [data-testid="stButton"] > button:disabled,
+    .stApp .st-key-vio_preview_queue [data-testid="stButton"] > button:disabled {{
+        background:{orange} !important; color:#fff !important; opacity:.55;
+    }}
     [data-testid='stSidebar'] {{ background:{bg2} !important; }}
     [data-testid='stSidebar'] * {{ color:{text} !important; }}
     .stMarkdown code {{ background:{bg2}; color:{code_text}; padding:2px 6px; border-radius:4px; border:1px solid {border}; }}
+    /* Chat: keep typed text and bubbles readable on the themed background */
+    [data-testid="stBottom"], [data-testid="stBottom"] > div {{ background:{bg} !important; }}
+    [data-testid="stChatInput"], [data-testid="stChatInput"] > div, [data-testid="stChatInput"] div[data-baseweb] {{
+        background:{card} !important; border-color:{border} !important;
+    }}
+    [data-testid="stChatInput"] textarea {{
+        color:{text} !important; -webkit-text-fill-color:{text} !important; caret-color:{text} !important;
+        background:transparent !important;
+    }}
+    [data-testid="stChatInput"] textarea::placeholder {{ color:{text2} !important; -webkit-text-fill-color:{text2} !important; opacity:1; }}
+    [data-testid="stChatInput"] button {{ background:{orange} !important; color:#fff !important; }}
+    [data-testid="stChatMessage"] {{ background:{card}; border:1px solid {border}; border-radius:14px; }}
+    [data-testid="stChatMessage"] * {{ color:{text}; }}
+    [data-testid="stChatMessage"] code {{ color:{code_text}; }}
     </style>
     """
 
 
 def render_top_bar() -> None:
-    """Persistent gradient top bar: brand, mode badge, theme toggle, change mode."""
-    mode = st.session_state.get("mode")
-    mode_label = "🌐 VIO Agents (Online)" if mode == "vio" else "🖥️ Ollama (Offline)"
+    """Persistent gradient top bar: brand, home and theme toggle."""
     st.markdown(
-        f"""
+        """
         <div class="av-topbar">
-            <div class="brand">AUMOVIO &nbsp;·&nbsp; Enterprise Test Generator
-                <small>&nbsp;| {mode_label}</small></div>
+            <div class="brand">AUMOVIO &nbsp;·&nbsp; TestGenie
+                <small>&nbsp;| your wish is my test suite</small></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    c1, c2, _ = st.columns([1, 1, 6])
+    c1, c2, c3 = st.columns([1, 1, 6])
     with c1:
-        if st.button("⟵ Change mode", use_container_width=True):
+        if st.button("⟵ Home", use_container_width=True):
             st.session_state["mode"] = None
             st.rerun()
     with c2:
@@ -2026,43 +2300,46 @@ def render_top_bar() -> None:
         if st.button(label, use_container_width=True):
             st.session_state["theme"] = "light" if cur == "dark" else "dark"
             st.rerun()
+    with c3:
+        if st.session_state.get("mode") == "vio":
+            st.caption("🟢 VIO connected" if st.session_state.get("vio_connected")
+                       else "⚪ VIO not connected yet; it connects when you start a run")
+
+
+LANDING_HTML = (
+    "<style>"
+    "@keyframes tt-bob{0%,100%{transform:translateY(0) rotate(-4deg)}50%{transform:translateY(-16px) rotate(4deg)}}"
+    "@keyframes tt-twinkle{0%,100%{transform:scale(.4);opacity:0}50%{transform:scale(1.15);opacity:1}}"
+    "@keyframes tt-shimmer{to{background-position:200% center}}"
+    "@keyframes tt-pulse{0%,100%{box-shadow:0 0 0 0 rgba(181,71,8,.55)}50%{box-shadow:0 0 0 14px rgba(181,71,8,0)}}"
+    ".tt-hero{text-align:center;margin:3rem 0 1.2rem;position:relative}"
+    ".tt-bot{font-size:4.6rem;display:inline-block;animation:tt-bob 3s ease-in-out infinite}"
+    ".tt-tick{position:absolute;font-size:1.3rem;animation:tt-twinkle 2.4s ease-in-out infinite}"
+    ".tt-name{font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:3.4rem;letter-spacing:.02em;"
+    "background:linear-gradient(90deg,#B54708,#7C3AED,#B54708);background-size:200% auto;"
+    "-webkit-background-clip:text;-webkit-text-fill-color:transparent;animation:tt-shimmer 4s linear infinite}"
+    ".tt-tag{font-size:1.1rem;color:var(--text2);margin-top:.3rem}"
+    ".st-key-enter_site button{animation:tt-pulse 2s infinite;font-size:1.05rem;padding:.6rem 1rem}"
+    "@media (prefers-reduced-motion:reduce){.tt-bot,.tt-tick,.tt-name,.st-key-enter_site button{animation:none}}"
+    "</style>"
+    '<div class="tt-hero">'
+    '<span class="tt-tick" style="left:36%;top:.6rem;animation-delay:0s">✨</span>'
+    '<span class="tt-tick" style="left:60%;top:1.4rem;animation-delay:.8s">✨</span>'
+    '<span class="tt-tick" style="left:66%;top:3rem;animation-delay:1.6s">⭐</span>'
+    '<div class="tt-bot">🧞</div>'
+    '<div class="tt-name">TestGenie</div>'
+    '<div class="tt-tag">Your wish is my test suite. Drop in a repo link and make a wish.</div>'
+    "</div>"
+)
 
 
 def render_mode_gate() -> None:
-    """Landing gate: choose VIO (online) or Ollama (offline)."""
-    st.markdown(
-        """
-        <div style="text-align:center; margin:2rem 0 1rem;">
-            <div style="font-family:'Space Grotesk',sans-serif; font-weight:700;
-                        font-size:2rem; background:linear-gradient(90deg,#B54708,#5B2A86);
-                        -webkit-background-clip:text; -webkit-text-fill-color:transparent;">
-                AUMOVIO Enterprise Test Generator
-            </div>
-            <div class="av-muted">Choose how you want to generate tests</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown(
-            '<div class="av-gate"><div class="ico">🌐</div>'
-            '<h3>VIO Agents (Online)</h3>'
-            '<div class="av-muted">5 cloud agents · fast (5–15s/test) · needs network</div></div>',
-            unsafe_allow_html=True,
-        )
-        if st.button("Use VIO Agents", key="gate_vio", use_container_width=True):
-            st.session_state["mode"] = "vio"
-            st.rerun()
-    with col2:
-        st.markdown(
-            '<div class="av-gate"><div class="ico">🖥️</div>'
-            '<h3>Ollama (Offline)</h3>'
-            '<div class="av-muted">3 local models · private · slower (CPU) · offline backup</div></div>',
-            unsafe_allow_html=True,
-        )
-        if st.button("Use Ollama (Local)", key="gate_ollama", use_container_width=True):
-            st.session_state["mode"] = "ollama"
+    """Landing page: product name, tagline and a single entry button."""
+    st.markdown(LANDING_HTML, unsafe_allow_html=True)
+    _, middle, _ = st.columns([2, 1, 2])
+    with middle:
+        if st.button("Make a wish", key="enter_site", use_container_width=True):
+            st.session_state["mode"] = "app"
             st.rerun()
 
 
@@ -2229,6 +2506,68 @@ def render_branch_graph() -> None:
     render_branch_controls()
 
 
+def _render_vio_spec_detail(agent: str, data: dict) -> None:
+    """Spec-driven worker view: agent README plus each spec, its script, pytest result and prompt."""
+    components = data.get("components", [])
+    tabs = st.tabs(["README & Result", "Specification", "Script", "Pytest result", "Prompt"])
+    with tabs[0]:
+        readme = data.get("readme", "")
+        if readme:
+            st.markdown(readme)
+            st.download_button("⬇️ Download README", data=readme, file_name=f"{agent}_README.md",
+                               mime="text/markdown", key=f"dl_readme_{agent}")
+        else:
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Passed", data.get("passed", 0))
+            m2.metric("Failed", data.get("failed", 0))
+            m3.metric("Errors", data.get("errors", 0))
+            st.info(f"{len(components)} specification(s) processed so far. The README appears when the run finishes.")
+
+    items = [item for item in components if item.get("spec")]
+    if not items:
+        for tab in tabs[1:]:
+            with tab:
+                st.info("No specification has been written for this agent yet.")
+        return
+    by_stem = {Path(item["spec"]).stem: item for item in items}
+    picked = st.selectbox(
+        "Specification", list(by_stem), key=f"vio_pick_{agent}",
+        format_func=lambda stem: f"{stem}  ·  {by_stem[stem].get('status', '')}",
+    )
+    chosen = by_stem[picked]
+    spec_path, script_path = Path(chosen["spec"]), Path(chosen["script"]) if chosen.get("script") else None
+    with tabs[1]:
+        if spec_path.exists():
+            spec_text = spec_path.read_text(encoding="utf-8")
+            st.markdown(spec_text)
+            st.download_button("⬇️ Download specification", data=spec_text, file_name=spec_path.name,
+                               mime="text/markdown", key=f"dl_spec_{agent}_{spec_path.stem}")
+    with tabs[2]:
+        if script_path and script_path.exists():
+            script_text = script_path.read_text(encoding="utf-8")
+            st.code(script_text, language="python")
+            st.download_button("⬇️ Download script", data=script_text, file_name=script_path.name,
+                               mime="text/x-python", key=f"dl_script_{agent}_{spec_path.stem}")
+        else:
+            st.info(chosen.get("error") or "No script was produced for this specification.")
+    with tabs[3]:
+        execution = chosen.get("execution") or {}
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Passed", execution.get("passed", 0))
+        c2.metric("Failed", execution.get("failed", 0))
+        c3.metric("Errors", execution.get("errors", 0))
+        for test in chosen.get("tests", []):
+            icon = {"PASSED": "✅", "FAILED": "❌", "ERROR": "🟠"}.get(test["status"], "•")
+            st.markdown(f"{icon} **{test['name']}** - {test['status'].lower()}")
+            if test.get("reason"):
+                st.caption(f"↳ {test['reason']}")
+        if execution.get("output"):
+            with st.expander("Full pytest output", expanded=False):
+                st.code(execution["output"], language="text")
+    with tabs[4]:
+        st.code(chosen.get("prompt", ""), language="text")
+
+
 def render_model_detail() -> None:
     """Clean, 4-tab artifact panel for the selected agent."""
     agent = st.session_state.get("selected_model")
@@ -2258,10 +2597,16 @@ def render_model_detail() -> None:
     if is_master:
         st.markdown("##### 🧠 What the master did")
         st.markdown(
-            "- **Validated** every worker's generated tests (quality gate: GOLD / SILVER / BRONZE)\n"
-            "- **Diagnosed** failures and guided auto-fixes\n"
+            "- **Planned** every numbered test specification from the real source code\n"
+            "- **Assigned** each specification to the specialist agent that owns most of its scenarios\n"
+            "- **Graded** every generated script (GOLD / SILVER / BRONZE)\n"
             "- **Wrote** the consolidated final report"
         )
+        for failure in data.get("plan_failures", []):
+            st.warning(
+                f"No specification for `{failure['component']}`: {failure['error']} "
+                f"Diagnostic: `{failure.get('failure_artifact', 'not saved')}`"
+            )
         vals = data.get("validations", [])
         if vals:
             st.markdown("##### ✅ Validation verdicts")
@@ -2275,6 +2620,10 @@ def render_model_detail() -> None:
             st.markdown(data["report"])
         return
 
+    # ── Worker (README-style) view ──
+    if "components" in data:
+        _render_vio_spec_detail(agent, data)
+        return
     # ── Worker (4-tab) view ──
     task = data.get("task_type", "—")
     cases = data.get("cases", [])
@@ -2496,13 +2845,7 @@ def _write_vio_conftest(repo_path: str) -> None:
     if not scripts_dir.exists():
         return
     try:
-        import_root, package = discover_package_import_root(Path(repo_path))
-        (scripts_dir / "conftest.py").write_text(
-            "import sys\n"
-            f"sys.path.insert(0, r\"{import_root}\")\n"
-            f"sys.path.insert(0, r\"{Path(repo_path)}\")\n",
-            encoding="utf-8",
-        )
+        write_test_support(repo_path)
     except Exception:
         pass
 
@@ -2675,20 +3018,207 @@ def _write_agent_readme(repo_path: str, task_id: str, result: dict) -> None:
     result["readme_path"] = str(readme_path)
 
 
-def _vio_process_task(client, repo_path, source_context, task_type, status_cb=None) -> tuple:
-    """Thread-safe worker: generate → validate → pytest → fix for one task.
+_VIO_SPECIALISATION = {"security": 2, "vulnerability": 2, "integration_test": 1, "e2e_test": 1, "api_test": 1}
 
-    Contains NO Streamlit calls so it can run inside a thread pool.
-    status_cb(str) is an optional callback to report live step status.
-    Returns (agent, result_dict).
-    """
-    def _report(s):
-        if status_cb:
+VIO_MODE_RECOMMENDED, VIO_MODE_CONTINUE, VIO_MODE_ALL = "recommended", "continue", "all"
+VIO_MODE_LABELS = {
+    VIO_MODE_RECOMMENDED: "Recommended batch (fresh start)",
+    VIO_MODE_CONTINUE: "Continue with uncovered",
+    VIO_MODE_ALL: "All meaningful components",
+}
+
+
+def _vio_clear_artifacts(repo_path: str) -> None:
+    """Remove stale generated files so specs and scripts from one run stay one-to-one."""
+    tests_dir = Path(repo_path) / "tests"
+    for sub in ("test_scripts", "orchestration_results"):
+        directory = tests_dir / sub
+        if directory.exists():
+            for path in directory.glob("*"):
+                try:
+                    if path.is_file():
+                        path.unlink()
+                except OSError:
+                    logger.warning("Could not remove stale VIO artifact: %s", path)
+    specs = tests_dir / "specs"
+    if specs.exists():
+        for path in specs.glob("*.md"):
             try:
-                status_cb(s)
-            except Exception:
-                pass
+                if path.read_text(encoding="utf-8").startswith(SPEC_MARKER_PREFIXES):
+                    path.unlink()
+            except OSError:
+                logger.warning("Could not remove stale generated spec: %s", path)
 
+
+def _vio_choose_writer(client, selected_types):
+    """Pick the specialist agent that owns most of a spec's scenarios."""
+    def choose(plan):
+        counts = Counter(scenario["test_type"] for scenario in plan["scenarios"])
+        best = max(selected_types, key=lambda t: (
+            counts.get(t, 0), _VIO_SPECIALISATION.get(t, 0), -selected_types.index(t)))
+        agent = TYPE_TO_AGENT.get(best, AGENTS["unit"])
+        return VIOGenerationAdapter(client, agent), agent, agent
+    return choose
+
+
+def _vio_aggregate_agent(agent, task_types, components, client, status):
+    """Combine per-component results into the agent-level state the UI reads."""
+    passed = failed = errors = 0
+    tests = []
+    levels = Counter()
+    ordered = sorted(components, key=lambda item: item.get("spec", item["component"]))
+    for item in ordered:
+        execution = item.get("execution")
+        item["tests"] = parse_pytest_output(execution.get("output", "")) if execution else []
+        if execution:
+            passed += execution.get("passed", 0)
+            failed += execution.get("failed", 0)
+            errors += execution.get("errors", 0)
+            tests.extend({**test, "component": item["component"]} for test in item["tests"])
+        else:
+            errors += 1
+        level = (item.get("validation") or {}).get("level")
+        if level and level != "N/A":
+            levels[level] += 1
+    level = levels.most_common(1)[0][0] if levels else "N/A"
+    return {
+        "status": status,
+        "agent": agent,
+        "task_type": ", ".join(task_types),
+        "components": ordered,
+        "results": tests,
+        "passed": passed,
+        "failed": failed,
+        "errors": errors,
+        "skipped": sum((item.get("execution") or {}).get("skipped", 0) for item in ordered),
+        "runnable": sum(1 for item in ordered if item.get("execution")),
+        "fully_passing": sum(1 for item in ordered if item.get("status") == "COMPLETED"),
+        "unresolved": sum(1 for item in ordered if item.get("repair_unresolved")),
+        "needs_review": sum(1 for item in ordered if item.get("review_flags")),
+        "tokens": client.token_usage.get(agent, 0),
+        "time_s": 0.0,
+        "validation": {
+            "level": level,
+            "reasons": ", ".join(f"{name}: {count}" for name, count in levels.most_common()) or "No quality verdicts",
+        },
+    }
+
+
+def _write_vio_agent_readme(repo_path: str, agent: str, data: dict) -> None:
+    """Write the per-agent report: aligned spec/script table, failures and fixes."""
+    components = data.get("components", [])
+    aligned = [c for c in components if c.get("spec") and c.get("script")]
+    readme = [
+        f"# {agent} - Specification-Driven Results",
+        "",
+        "## Summary",
+        "",
+        "| Specs | Runnable scripts | Fully passing scripts | Tests passed | Tests failed | Errors | Skipped | Flagged for review |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        f"| {len([c for c in components if c.get('spec')])} | {len(aligned)} | {data.get('fully_passing', 0)} | "
+        f"{data.get('passed', 0)} | {data.get('failed', 0)} | {data.get('errors', 0)} | {data.get('skipped', 0)} | "
+        f"{data.get('needs_review', 0)} |",
+        "",
+        f"- Reviewer opinion (advisory only, not a pass/fail signal): {data.get('validation', {}).get('level', 'N/A')}",
+        f"- Agent: `{agent}` ({AGENT_MODELS.get(agent, '')})",
+        f"- Repository: `{Path(repo_path).name}`",
+        f"- Test types handled: {data.get('task_type') or '-'}",
+        f"- Tokens used: {data.get('tokens', 0)}",
+        "",
+        "## Spec / Script / Pytest Alignment",
+        "",
+        "Each row is one numbered specification, the single script that implements it, and its pytest result.",
+        "",
+        "| Specification | Test script | Component | Scenarios | Passed | Failed | Reviewer opinion (advisory) | Outcome |",
+        "| --- | --- | --- | ---: | ---: | ---: | --- | --- |",
+    ]
+    for item in components:
+        execution = item.get("execution") or {}
+        spec = Path(item["spec"]).name if item.get("spec") else "-"
+        script = Path(item["script"]).name if item.get("script") else "-"
+        quality = (item.get("validation") or {}).get("level", "N/A")
+        readme.append(
+            f"| {spec} | {script} | `{item['component']}` | {item.get('scenarios', 0)} | "
+            f"{execution.get('passed', 0)} | {execution.get('failed', 0) + execution.get('errors', 0)} | "
+            f"{quality} | {item.get('status', 'FAILED')} |"
+        )
+
+    failing = [(item, test) for item in components for test in item.get("tests", [])
+               if test.get("status") in {"FAILED", "ERROR"}]
+    if failing:
+        readme.extend(["", "## Failure Analysis"])
+    for item, test in failing:
+        cause, solution = _failure_analysis(test)
+        readme.extend([
+            "", f"### `{test['name']}` in `{Path(item['script']).name}`", "",
+            f"**Reason reported by pytest:** {test.get('reason') or 'not parsed'}", "",
+            f"**Why it happened:** {cause}", "", f"**Recommended solution:** {solution}",
+        ])
+
+    unaligned = [item for item in components if not item.get("execution")]
+    if unaligned:
+        readme.extend(["", "## Components Without a Runnable Script", ""])
+        for item in unaligned:
+            readme.append(
+                f"- `{item['component']}`: {item.get('error') or 'no script was produced'} "
+                f"Diagnostic artifact: `{item.get('failure_artifact', 'not saved')}`"
+            )
+
+    repaired = [item for item in components if item.get("repair_applied")]
+    if repaired:
+        readme.extend(["", "## Automated Repair", "",
+                       f"{len(repaired)} script(s) were repaired after a failing pytest run and now pass completely."])
+    unresolved = [item for item in components if item.get("repair_unresolved")]
+    if unresolved:
+        readme.extend(["", "## Failing Tests Left After Repair", ""])
+        for item in unresolved:
+            partly = " (partly repaired)" if item.get("repair_partial") else ""
+            readme.append(f"- `{item['component']}`{partly}: {', '.join(f'`{name}`' for name in item['repair_unresolved'])}")
+    flagged = [item for item in components if item.get("review_flags")]
+    if flagged:
+        readme.extend(["", "## Flagged For Human Review", "",
+                       "Static checks could not confirm these tests set up their preconditions or check what the "
+                       "specification expects.", ""])
+        for item in flagged:
+            readme.extend(f"- `{item['component']}`: {finding}" for finding in item["review_flags"][:6])
+
+    content = "\n".join(readme) + "\n"
+    path = Path(repo_path) / "tests" / "orchestration_results" / f"{agent}_README.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    data["readme"] = content
+    data["readme_path"] = str(path)
+
+
+def _write_vio_traceability(repo_path: str, results: list) -> None:
+    rows = [
+        {key: item.get(key) for key in (
+            "component", "spec", "script", "writer", "scenarios", "status", "error",
+            "failure_stage", "failure_artifact", "attempts_captured", "repair_attempted", "repair_applied",
+            "repair_partial", "repair_unresolved", "review_flags",
+        )}
+        | {"passed": (item.get("execution") or {}).get("passed", 0),
+           "failed": (item.get("execution") or {}).get("failed", 0),
+           "errors": (item.get("execution") or {}).get("errors", 0)}
+        for item in results
+    ]
+    (Path(repo_path) / "tests" / "spec_traceability.json").write_text(
+        json.dumps(rows, indent=2), encoding="utf-8")
+
+
+def _build_aligned_bundle(repo_path: str) -> bytes:
+    """ZIP of specs, matching scripts, pytest results and READMEs for download."""
+    tests_dir = Path(repo_path) / "tests"
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for folder, pattern in (("specs", "*.md"), ("test_scripts", "*_test.py"),
+                                ("orchestration_results", "*.md"), ("coverage", "*.md")):
+            for path in sorted((tests_dir / folder).glob(pattern)):
+                archive.write(path, f"{folder}/{path.name}")
+        trace = tests_dir / "spec_traceability.json"
+        if trace.exists():
+            archive.write(trace, trace.name)
+    return buffer.getvalue()
     agent = TYPE_TO_AGENT.get(task_type, AGENTS["unit"])
     task_id = f"{task_type}_0"
     result = {"status": "generating", "task_type": task_type, "tokens": 0, "time_s": 0.0}
@@ -2923,27 +3453,64 @@ def _vio_background_run(
     parallel,
     models_state,
     run_state,
+    max_components=0,
+    mode=VIO_MODE_RECOMMENDED,
+    target="",
 ) -> None:
-    """Run VIO tasks without calling Streamlit from the worker thread."""
-    def set_status(agent, status):
-        models_state[agent] = {**models_state.get(agent, {}), "status": status}
-
+    """Spec-driven VIO run: master plans each spec, a specialist writes its script, pytest verifies it."""
+    master = AGENTS["master"]
+    lock = threading.Lock()
+    per_agent: dict = {}
+    plan_failures: list = []
     try:
-        for sub in ("test_scripts", "orchestration_results"):
-            directory = Path(repo_path) / "tests" / sub
-            if directory.exists():
-                for path in directory.glob("*"):
-                    try:
-                        if path.is_file():
-                            path.unlink()
-                    except OSError:
-                        logger.warning("Could not remove stale VIO artifact: %s", path)
-
-        source_context, _ = gather_source_context(repo_path, max_chars=8000)
-        scripts_dir = Path(repo_path) / "tests" / "test_scripts"
-        scripts_dir.mkdir(parents=True, exist_ok=True)
+        resume = mode != VIO_MODE_RECOMMENDED
+        run_state.setdefault("mode", "continue" if resume else "run")
+        run_progress.set_phase(run_state, "discover")
+        if not resume:
+            _vio_clear_artifacts(repo_path)
+        (Path(repo_path) / "tests" / "test_scripts").mkdir(parents=True, exist_ok=True)
         _write_vio_conftest(repo_path)
 
+        queue = select_components(repo_path, discover_components(repo_path), resume=resume)
+        run_state["excluded"] = queue["excluded"]
+        pending = queue["pending"]
+        if target:
+            pending = [c for c in pending if target.lower() in (c["module"] + "." + c["symbol"]).lower()]
+            if not pending:
+                raise ValueError(f"No component matching '{target}' is waiting for a specification.")
+        components, import_failures = preflight_components(repo_path, pending)
+        plan_failures.extend(import_failures)
+        if max_components:
+            components = components[:max_components]
+        if not components:
+            if not import_failures and queue["already_specified"]:
+                raise ValueError(
+                    "Every meaningful component already has a specification. "
+                    "Use 'Re-run failed specs' to retry the ones that failed.")
+            detail = "; ".join(item["error"] for item in import_failures[:3])
+            raise ValueError("No importable public Python components were found to specify. " + detail)
+        carried = 0
+        if resume:
+            batch = {c["module"] + "." + c["symbol"] for c in components} | {f["component"] for f in import_failures}
+            for item in (_vio_load_state(repo_path) or {}).get("results", []):
+                if item["component"] not in batch:
+                    (per_agent.setdefault(item["writer"], []) if item.get("writer") else plan_failures).append(item)
+                    carried += 1
+        run_progress.begin_components(run_state, len(components) + len(import_failures), len(import_failures))
+        models_state[master] = {
+            "status": "generating", "task_type": "supervision", "tokens": 0,
+            "validations": [], "report": "", "repo": str(repo_path),
+        }
+        planner = VIOGenerationAdapter(client, master)
+        choose_writer = _vio_choose_writer(client, selected_types)
+
+        def work(component):
+            identity = component["module"] + "." + component["symbol"]
+            if run_progress.checkpoint(run_state):
+                run_state["not_started"] = run_state.get("not_started", 0) + 1
+                return
+            with lock:
+                run_state["current"] = run_state["current"] + [identity]
         # Auto-install repository dependencies before test generation
         # This ensures generated tests can import the target package
         logger.info("Installing repository dependencies for test execution...")
@@ -2961,37 +3528,46 @@ def _vio_background_run(
         def work(task_type):
             agent = TYPE_TO_AGENT.get(task_type, AGENTS["unit"])
             try:
-                result_agent, result = _vio_process_task(
-                    client,
-                    repo_path,
-                    source_context,
-                    task_type,
-                    status_cb=lambda status: set_status(agent, status),
+                result = process_component(
+                    repo_path, component, selected_types, planner, master,
+                    extract_python_code, run_pytest_single,
+                    choose_writer=choose_writer, engine="vio",
+                    on_stage=lambda stage: run_progress.record_stage(run_state, identity, stage),
                 )
-                models_state[result_agent] = result
+                if result.get("code"):
+                    verdict = client.validate(result["code"], component["source"])
+                    if not verdict.get("ok"):
+                        verdict["level"] = "N/A"
+                    result["validation"] = verdict
             except Exception as exc:  # pragma: no cover - defensive
-                logger.exception("VIO task failed for %s", task_type)
-                failure = {
-                    "status": "error",
-                    "agent": agent,
-                    "task_type": task_type,
-                    "error": str(exc),
-                    "validation": {"level": "-", "reasons": str(exc)},
-                    "results": [],
-                    "passed": 0,
-                    "failed": 0,
-                    "errors": 1,
-                }
-                try:
-                    _write_agent_readme(repo_path, f"{task_type}_0", failure)
-                except Exception:
-                    logger.exception("Could not write the failure README for %s", task_type)
-                models_state[agent] = failure
+                logger.exception("VIO component failed: %s", identity)
+                result = {"component": identity, "status": "FAILED", "error": str(exc)}
+            with lock:
+                agent = result.get("writer")
+                if agent:
+                    per_agent.setdefault(agent, []).append(result)
+                    types = [t for t in selected_types if TYPE_TO_AGENT.get(t, AGENTS["unit"]) == agent]
+                    models_state[agent] = _vio_aggregate_agent(agent, types, per_agent[agent], client, "testing")
+                else:
+                    plan_failures.append(result)
+                run_state["done"] += 1
+                run_state["current"] = [name for name in run_state["current"] if name != identity]
+                run_progress.clear_stage(run_state, identity)
+                models_state[master] = {**models_state[master], "tokens": client.token_usage.get(master, 0)}
 
-        if parallel and len(selected_types) > 1:
-            with ThreadPoolExecutor(max_workers=min(4, len(selected_types))) as executor:
-                list(executor.map(work, selected_types))
+        for task_type in selected_types:
+            agent = TYPE_TO_AGENT.get(task_type, AGENTS["unit"])
+            models_state[agent] = {**models_state.get(agent, {}), "status": "generating", "task_type": task_type}
+
+        if parallel and len(components) > 1:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                list(executor.map(work, components))
         else:
+            for component in components:
+                work(component)
+
+        _vio_finalize(client, repo_path, selected_types, models_state, run_state,
+                      per_agent, plan_failures, len(components) + carried)
             for task_type in selected_types:
                 work(task_type)
 
@@ -3032,6 +3608,274 @@ def _vio_background_run(
         run_state["report"] = report_text
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("VIO orchestration failed")
+        run_state["error"] = str(exc)
+    finally:
+        run_state["active"] = False
+        run_state["finished"] = True
+
+
+def _vio_raise_coverage(client, repo_path, selected_types, run_state, per_agent, plan_failures) -> dict:
+    """Measure source coverage and top up the weakest components until it reaches COVERAGE_TARGET."""
+    master = AGENTS["master"]
+    planner = VIOGenerationAdapter(client, master)
+    choose_writer = _vio_choose_writer(client, selected_types)
+    lock = threading.Lock()
+    components = discover_components(repo_path)
+
+    def all_results():
+        return [item for items in (*per_agent.values(), plan_failures) for item in items]
+
+    def measure(path, found):
+        return measure_coverage(path, found, results=all_results())
+
+    def top_up(component, row):
+        identity = row["component"]
+        if run_progress.checkpoint(run_state):
+            return None
+        with lock:
+            previous = next((item for items in (*per_agent.values(), plan_failures)
+                             for item in items if item["component"] == identity), None)
+            run_state["current"] = run_state.get("current", []) + [f"{identity} (raising coverage)"]
+        try:
+            result = top_up_component(
+                repo_path, component, row, previous, selected_types, planner, master,
+                extract_python_code, run_pytest_single, choose_writer=choose_writer, engine="vio")
+        finally:
+            with lock:
+                run_state["current"] = [n for n in run_state.get("current", []) if not n.startswith(identity + " (")]
+        if result and result.get("component") and result is not previous:
+            with lock:
+                for items in (*per_agent.values(), plan_failures):
+                    items[:] = [item for item in items if item["component"] != identity]
+                (per_agent.setdefault(result["writer"], []) if result.get("writer") else plan_failures).append(result)
+        return result
+
+    return raise_coverage(
+        repo_path, components, measure(repo_path, components), top_up, measure=measure,
+        **({"rounds": 0} if run_state.get("measure_only") else {}),
+        exclude={item["component"] for item in all_results()
+                 if item.get("failure_stage") == "import preflight"
+                 or (item.get("script") and item.get("status") != "COMPLETED")})
+
+
+def _vio_finalize(client, repo_path, selected_types, models_state, run_state, per_agent, plan_failures, total):
+    """Write per-agent reports, traceability, coverage, bundle and the final report; persist run state."""
+    master = AGENTS["master"]
+    cancelled = bool(run_state.get("cancel"))
+    run_state["cancelled"] = cancelled
+    run_progress.set_phase(run_state, "coverage")
+    try:
+        if cancelled:
+            coverage = {"error": "the run was cancelled before coverage was measured"}
+        else:
+            coverage = _vio_raise_coverage(client, repo_path, selected_types, run_state, per_agent, plan_failures)
+    except Exception as exc:  # coverage is auxiliary: never lose the generated specs, scripts and state
+        logger.exception("Coverage step failed")
+        coverage = {"error": f"coverage step failed: {exc}"}
+    run_state["coverage"] = coverage
+    all_results = [item for items in per_agent.values() for item in items] + plan_failures
+    for task_type in selected_types:
+        agent = TYPE_TO_AGENT.get(task_type, AGENTS["unit"])
+        if agent in per_agent:
+            continue
+        models_state[agent] = _vio_aggregate_agent(agent, [task_type], [], client, "idle")
+    for agent, items in per_agent.items():
+        types = [t for t in selected_types if TYPE_TO_AGENT.get(t, AGENTS["unit"]) == agent]
+        data = _vio_aggregate_agent(agent, types, items, client, "done")
+        if data["passed"] == 0:
+            data["status"] = "error"
+        _write_vio_agent_readme(repo_path, agent, data)
+        models_state[agent] = data
+    for agent in {TYPE_TO_AGENT.get(t, AGENTS["unit"]) for t in selected_types} - set(per_agent):
+        _write_vio_agent_readme(repo_path, agent, models_state[agent])
+
+    _write_vio_traceability(repo_path, all_results)
+    _vio_save_state(repo_path, selected_types, all_results)
+    run_history.record(repo_path, run_history.build_entry(run_state, all_results, coverage))
+
+    summary_lines = [
+        f"- {agent}: {data.get('runnable', 0)} of {len(data.get('components', []))} specs have a runnable script, "
+        f"{data.get('fully_passing', 0)} script(s) pass completely; {data.get('passed', 0)} tests passed, "
+        f"{data.get('failed', 0)} failed, {data.get('errors', 0)} errors, {data.get('skipped', 0)} skipped; "
+        f"advisory reviewer opinion (not a pass/fail signal)={data.get('validation', {}).get('level', '?')}"
+        for agent, data in models_state.items() if agent != master and "passed" in data
+    ]
+    summary_lines.append(
+        f"- Specifications written: {sum(1 for item in all_results if item.get('spec'))} of "
+        f"{total}; components without a runnable script: "
+        f"{sum(1 for item in all_results if not item.get('execution'))}"
+    )
+    if coverage.get("error"):
+        summary_lines.append(f"- Source coverage unavailable: {coverage['error']}")
+    else:
+        summary_lines.append(
+            f"- Source coverage (line + branch, passing tests only): {coverage['percent']}% (target "
+            f"{coverage['target']:g}%, {'met' if coverage['target_met'] else 'NOT met'} after "
+            f"{coverage['rounds']} top-up round(s))")
+        weakest = [row for row in coverage["components"] if row["percent"] is not None and row["percent"] < 100][:5]
+        summary_lines.extend(
+            f"- Lowest coverage: {row['component']} {row['percent']}% ({'specified' if row['specified'] else 'no spec yet'})"
+            for row in weakest
+        )
+    totals = [sum(data.get(key, 0) for agent, data in models_state.items() if agent != master and "passed" in data)
+              for key in ("passed", "failed", "errors")]
+    summary_lines.append(f"- Test totals: {totals[0]} passed, {totals[1]} failed, {totals[2]} errors")
+    unresolved = [item for item in all_results if item.get("repair_unresolved")]
+    if unresolved:
+        summary_lines.append(
+            f"- Failing tests left after automated repair: {sum(len(item['repair_unresolved']) for item in unresolved)} "
+            f"in {len(unresolved)} component(s)")
+    flagged = [item for item in all_results if item.get("review_flags")]
+    if flagged:
+        summary_lines.append(
+            f"- Scripts flagged for human review (missing precondition setup or unchecked expected results): "
+            f"{len(flagged)}")
+    stage_seconds: dict = {}
+    for item in all_results:
+        for stage_name, seconds in (item.get("timings") or {}).items():
+            stage_seconds[stage_name] = stage_seconds.get(stage_name, 0) + seconds
+    if stage_seconds:
+        summary_lines.append("- Time spent per stage (summed over components, seconds): " + ", ".join(
+            f"{name} {value:.0f}" for name, value in sorted(stage_seconds.items(), key=lambda pair: -pair[1])))
+    broken = [item for item in all_results if item.get("status") != "COMPLETED"]
+    summary_lines.append(
+        f"- Components not passing completely: {len(broken)} of {total}"
+        + ("" if broken else " (every component passes)"))
+    summary_lines.extend(f"- FAILED {item['component']}: {describe_failure(item)}" for item in broken[:12])
+    run_progress.set_phase(run_state, "report")
+    if cancelled:
+        report_text = ("The run was cancelled. Results for the components that finished are saved; "
+                       "choose 'Uncovered components' to continue with the rest.")
+    else:
+        report = client.report("Repository: " + str(repo_path) + "\n" + "\n".join(summary_lines))
+        report_text = report["content"] if report.get("ok") else ""
+
+    models_state[master] = {
+        "status": "done", "task_type": "supervision",
+        "tokens": client.token_usage.get(master, 0),
+        "validations": [
+            {"agent": agent, "level": data["validation"]["level"], "reasons": data["validation"]["reasons"]}
+            for agent, data in models_state.items() if agent != master and data.get("validation")
+        ],
+        "plan_failures": [
+            {"component": item["component"], "error": item.get("error", "")} for item in plan_failures
+        ],
+        "report": report_text, "repo": str(repo_path),
+    }
+    run_state["report"] = report_text
+    (Path(repo_path) / "tests" / "final_report.md").write_text(report_text, encoding="utf-8")
+    run_state["bundle"] = _build_aligned_bundle(repo_path)
+
+
+def _vio_state_path(repo_path) -> Path:
+    return Path(repo_path) / "tests" / "vio_run_state.json"
+
+
+def _vio_save_state(repo_path, selected_types, results) -> None:
+    """Persist full per-component results so failed specs can be re-run later, even after a restart."""
+    _vio_state_path(repo_path).write_text(
+        json.dumps({"types": list(selected_types), "results": results}, default=str), encoding="utf-8")
+
+
+def _vio_load_state(repo_path):
+    try:
+        state = json.loads(_vio_state_path(repo_path).read_text(encoding="utf-8"))
+        return state if state.get("results") else None
+    except (OSError, ValueError):
+        return None
+
+
+def _vio_rerunnable(results) -> list:
+    """Failed components that a new attempt can change; import failures need dependencies, not the model."""
+    return [item for item in results
+            if item.get("status") == "FAILED" and item.get("failure_stage") != "import preflight"]
+
+
+def _vio_rerunnable_count(repo_path) -> int:
+    state = _vio_load_state(repo_path) if repo_path else None
+    return len(_vio_rerunnable(state["results"])) if state else 0
+
+
+def _vio_rerun_background(client, repo_path, parallel, models_state, run_state) -> None:
+    """Retry only the failed specs: re-plan the ones with no spec, diagnose and repair the ones whose tests fail."""
+    master = AGENTS["master"]
+    lock = threading.Lock()
+    try:
+        state = _vio_load_state(repo_path)
+        if not state:
+            raise ValueError("No earlier VIO run was found for this repository.")
+        selected_types = state["types"]
+        results = {item["component"]: item for item in state["results"]}
+        targets = _vio_rerunnable(results.values())
+        if not targets:
+            raise ValueError("There are no failed specifications to re-run.")
+        discovered = {c["module"] + "." + c["symbol"]: c for c in discover_components(repo_path)}
+        run_progress.begin_components(run_state, len(targets))
+        models_state[master] = {
+            "status": "generating", "task_type": "supervision", "tokens": client.token_usage.get(master, 0),
+            "validations": [], "report": "", "repo": str(repo_path),
+        }
+        for task_type in selected_types:
+            agent = TYPE_TO_AGENT.get(task_type, AGENTS["unit"])
+            models_state[agent] = {**models_state.get(agent, {}), "status": "generating", "task_type": task_type}
+        planner = VIOGenerationAdapter(client, master)
+        choose_writer = _vio_choose_writer(client, selected_types)
+
+        def work(previous):
+            identity = previous["component"]
+            if run_progress.checkpoint(run_state):
+                run_state["not_started"] = run_state.get("not_started", 0) + 1
+                return
+            with lock:
+                run_state["current"] = run_state["current"] + [identity]
+            component = discovered.get(identity)
+            try:
+                if component is None:
+                    result = {**previous, "error": "Component no longer exists in the repository."}
+                else:
+                    result = rerun_component(
+                        repo_path, component, previous, selected_types, planner, master,
+                        extract_python_code, run_pytest_single, choose_writer=choose_writer, engine="vio",
+                        on_stage=lambda stage: run_progress.record_stage(run_state, identity, stage),
+                    )
+                    if result.get("code"):
+                        verdict = client.validate(result["code"], component["source"])
+                        if not verdict.get("ok"):
+                            verdict["level"] = "N/A"
+                        result["validation"] = verdict
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.exception("VIO re-run failed: %s", identity)
+                result = {**previous, "status": "FAILED", "error": str(exc)}
+            with lock:
+                results[identity] = result
+                run_state["done"] += 1
+                run_state["current"] = [name for name in run_state["current"] if name != identity]
+                run_progress.clear_stage(run_state, identity)
+
+        # Two workers: a gateway that already timed out should not be hit by four large prompts at once.
+        if parallel and len(targets) > 1:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                list(executor.map(work, targets))
+        else:
+            for previous in targets:
+                work(previous)
+
+        per_agent: dict = {}
+        plan_failures: list = []
+        for item in results.values():
+            (per_agent.setdefault(item["writer"], []) if item.get("writer") else plan_failures).append(item)
+        run_state["rerun_summary"] = {
+            "attempted": len(targets),
+            "fixed": sum(1 for item in targets if results[item["component"]].get("status") == "COMPLETED"),
+            "needs_review": [
+                {"component": item["component"], "reason": results[item["component"]].get("error", "")}
+                for item in targets if results[item["component"]].get("status") != "COMPLETED"
+            ],
+        }
+        _vio_finalize(client, repo_path, selected_types, models_state, run_state,
+                      per_agent, plan_failures, len(results))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("VIO re-run failed")
         run_state["error"] = str(exc)
     finally:
         run_state["active"] = False
@@ -3167,7 +4011,8 @@ def _legacy_run_vio_orchestration(selected_types: list, parallel: bool = True, g
     st.success("VIO generation complete! Click a branch to inspect each agent.")
 
 
-def run_vio_orchestration(selected_types: list, parallel: bool = True) -> None:
+def run_vio_orchestration(selected_types: list, parallel: bool = True, max_components: int = 0,
+                          mode: str = VIO_MODE_RECOMMENDED, target: str = "") -> None:
     """Initialize shared per-agent state and launch VIO work in a background thread."""
     client = st.session_state.get("vio_client")
     repo_path = st.session_state.get("repository_path")
@@ -3204,11 +4049,103 @@ def run_vio_orchestration(selected_types: list, parallel: bool = True) -> None:
 
     worker = threading.Thread(
         target=_vio_background_run,
-        args=(client, repo_path, selected_types.copy(), parallel, models_state, run_state),
+        args=(client, repo_path, selected_types.copy(), parallel, models_state, run_state, max_components, mode,
+              target),
         name="vio-test-generation",
         daemon=True,
     )
     worker.start()
+
+
+def run_vio_rerun_failed(repo_path: str, parallel: bool = True) -> None:
+    """Launch the background job that retries only the failed specs of the last VIO run."""
+    client = st.session_state.get("vio_client")
+    if not client:
+        st.error("Connect to VIO first.")
+        return
+    if (st.session_state.get("vio_run_state") or {}).get("active"):
+        st.warning("VIO generation is already running.")
+        return
+    state = _vio_load_state(repo_path)
+    if not state:
+        st.warning("No earlier VIO run was found for this repository.")
+        return
+
+    models_state = {
+        TYPE_TO_AGENT.get(task_type, AGENTS["unit"]): {"status": "queued", "task_type": task_type, "tokens": 0}
+        for task_type in state["types"]
+    }
+    models_state.setdefault(AGENTS["master"], {"status": "idle", "task_type": "supervision", "tokens": 0})
+    run_state = {"active": True, "finished": False, "report": "", "error": "", "mode": "rerun"}
+    st.session_state["models"] = models_state
+    st.session_state["vio_run_state"] = run_state
+    threading.Thread(
+        target=_vio_rerun_background,
+        args=(client, repo_path, parallel, models_state, run_state),
+        name="vio-test-rerun",
+        daemon=True,
+    ).start()
+
+
+def _vio_topup_background(client, repo_path, identity, row, models_state, run_state) -> None:
+    """Add tests for one specified component's uncovered lines, then rebuild reports without further top-ups."""
+    master = AGENTS["master"]
+    try:
+        state = _vio_load_state(repo_path)
+        if not state:
+            raise ValueError("No earlier VIO run was found for this repository.")
+        selected_types = state["types"]
+        component = next((c for c in discover_components(repo_path) if c["module"] + "." + c["symbol"] == identity), None)
+        if component is None:
+            raise ValueError(f"{identity} no longer exists in the repository.")
+        results = {item["component"]: item for item in state["results"]}
+        run_progress.begin_components(run_state, 1)
+        run_state["current"] = [f"{identity} (raising coverage)"]
+        results[identity] = top_up_component(
+            repo_path, component, row, results.get(identity), selected_types,
+            VIOGenerationAdapter(client, master), master, extract_python_code, run_pytest_single,
+            choose_writer=_vio_choose_writer(client, selected_types), engine="vio")
+        run_state.update(done=1, current=[], topup_summary={
+            "component": identity, "result": results[identity].get("topup", "")})
+        per_agent: dict = {}
+        plan_failures: list = []
+        for item in results.values():
+            (per_agent.setdefault(item["writer"], []) if item.get("writer") else plan_failures).append(item)
+        _vio_finalize(client, repo_path, selected_types, models_state, run_state,
+                      per_agent, plan_failures, len(results))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("VIO coverage top-up failed")
+        run_state["error"] = str(exc)
+    finally:
+        run_state["active"] = False
+        run_state["finished"] = True
+
+
+def run_vio_topup(repo_path: str, row: dict) -> str:
+    """Launch a background top-up for one component; returns an error message, or '' when started."""
+    if (st.session_state.get("vio_run_state") or {}).get("active"):
+        return "A run is already in progress."
+    client = _chat_vio_client()
+    if client is None:
+        return "I can't reach VIO. Check VIO_API_KEY in your .env."
+    state = _vio_load_state(repo_path)
+    if not state:
+        return "No earlier VIO run was found for this repository."
+    models_state = {
+        TYPE_TO_AGENT.get(task_type, AGENTS["unit"]): {"status": "queued", "task_type": task_type, "tokens": 0}
+        for task_type in state["types"]
+    }
+    models_state.setdefault(AGENTS["master"], {"status": "idle", "task_type": "supervision", "tokens": 0})
+    run_state = {"active": True, "finished": False, "report": "", "error": "", "mode": "topup", "measure_only": True}
+    st.session_state["models"] = models_state
+    st.session_state["vio_run_state"] = run_state
+    threading.Thread(
+        target=_vio_topup_background,
+        args=(client, repo_path, row["component"], row, models_state, run_state),
+        name="vio-coverage-topup",
+        daemon=True,
+    ).start()
+    return ""
 
 
 def _start_vio_run(client, repo_path: str, selected_types: list, parallel: bool) -> None:
@@ -3269,6 +4206,12 @@ def render_vio_workspace() -> None:
         key="vio_repo_url",
         placeholder="https://github.com/owner/repository",
     )
+    if st.button(
+        "Clone repository only",
+        key="vio_clone_only",
+        help="Clones or reuses the repository without generating a prompt or starting VIO.",
+    ):
+        clone_repository_only(repo_url)
 
     type_map = {
         "🧪 Unit": "unit_test",
@@ -3286,14 +4229,69 @@ def render_vio_workspace() -> None:
 
     parallel = st.checkbox(
         "⚡ Run agents in parallel", value=True, key="vio_parallel",
-        help="Run all selected test types concurrently (much faster for VIO).",
+        help="Process up to four components concurrently (much faster for VIO).",
     )
+    mode = st.radio(
+        "Which components to specify", list(VIO_MODE_LABELS), format_func=VIO_MODE_LABELS.get,
+        key="vio_select_mode", horizontal=True,
+        help="Recommended: the most important components, clearing earlier generated files. Continue: the next "
+             "most important components that have no spec yet, keeping everything already generated. All: every "
+             "meaningful component without a spec. Trivial markers and internal helpers are always skipped.",
+    )
+    max_components = st.number_input(
+        "Components per batch", min_value=1, max_value=500, value=20, step=5,
+        key="vio_max_components", disabled=mode == VIO_MODE_ALL,
+        help="Each component gets one numbered spec and one matching script, most important first. "
+             "Every component costs several VIO requests, so start small.",
+    )
+    confirm_all = True
+    if mode == VIO_MODE_ALL:
+        confirm_all = st.checkbox(
+            "I understand this runs every meaningful component without a spec and can take a long time",
+            key="vio_confirm_all",
+        )
 
-    run_col, dep_col = st.columns([1, 1])
+    preview_path = st.session_state.get("repository_path")
+    if not preview_path and repo_url.strip():
+        guess = REPOSITORIES_DIR / repository_name(repo_url.strip())
+        preview_path = str(guess) if guess.exists() else None
+    if st.button("Preview queue", key="vio_preview_queue", disabled=not preview_path,
+                 help="Shows what would be specified, without calling VIO."):
+        with st.spinner("Scanning components..."):
+            st.session_state["vio_queue_preview"] = {
+                "path": str(preview_path),
+                "queue": select_components(preview_path, discover_components(preview_path),
+                                           resume=mode != VIO_MODE_RECOMMENDED),
+            }
+    preview = st.session_state.get("vio_queue_preview")
+    if preview and preview["path"] == str(preview_path):
+        queue = preview["queue"]
+        batch = len(queue["pending"]) if mode == VIO_MODE_ALL else min(int(max_components), len(queue["pending"]))
+        st.caption(
+            f"{queue['meaningful']} meaningful components, {queue['already_specified']} already specified, "
+            f"{len(queue['pending'])} pending, {len(queue['excluded'])} skipped as not worth a spec. "
+            f"This run would specify {batch}.")
+        if queue["excluded"]:
+            with st.expander(f"Skipped components ({len(queue['excluded'])})"):
+                st.dataframe(queue["excluded"], width="stretch")
+
+    run_col, rerun_col, dep_col = st.columns([1, 1, 1])
     run_state = st.session_state.get("vio_run_state") or {}
     with run_col:
         run = st.button("▶️ Generate with VIO Agents", use_container_width=True,
-                        disabled=not connected or run_state.get("active", False))
+                        disabled=not connected or run_state.get("active", False) or not confirm_all)
+    with rerun_col:
+        known_path = st.session_state.get("repository_path")
+        if not known_path and repo_url.strip():
+            guess = REPOSITORIES_DIR / repository_name(repo_url.strip())
+            known_path = str(guess) if guess.exists() else None
+        failed_count = _vio_rerunnable_count(known_path)
+        rerun = st.button(
+            f"🔁 Re-run failed specs ({failed_count})", use_container_width=True, key="vio_rerun_failed",
+            disabled=not connected or run_state.get("active", False) or not failed_count,
+            help="Retries only the failed specs. VIO first diagnoses each failure, then re-plans specs that "
+                 "were never written or rewrites only the failing tests. Passing specs are not touched.",
+        )
     with dep_col:
         if st.button("📦 Install Repo Dependencies", use_container_width=True,
                      key="vio_install_deps"):
@@ -3309,6 +4307,9 @@ def render_vio_workspace() -> None:
         (st.success if dep_result.get("success") else st.warning)(
             dep_result.get("message", ""))
 
+    if rerun and known_path:
+        run_vio_rerun_failed(known_path, parallel=parallel)
+
     if run:
         if not selected_types:
             st.warning("Select at least one test type.")
@@ -3317,7 +4318,762 @@ def render_vio_workspace() -> None:
         else:
             generate_repository_prompt(repo_url)  # clone + set repository_path
             if st.session_state.get("repository_path"):
-                run_vio_orchestration(selected_types, parallel=parallel)
+                run_vio_orchestration(selected_types, parallel=parallel,
+                                      max_components=0 if mode == VIO_MODE_ALL else int(max_components), mode=mode)
+
+
+CHAT_GREETING = (
+    "**Hi there! How can I help you?**\n\n"
+    "Share the GitHub repository link and the type of tests you need: unit, integration, e2e or security. "
+    "For example: `https://github.com/owner/repository` with unit tests."
+)
+CHAT_CUSTOM = chat_assistant.CUSTOM_MODE
+CHAT_SPEC_LABELS = {
+    VIO_MODE_ALL: "Run all components",
+    CHAT_CUSTOM: "Customised",
+    VIO_MODE_CONTINUE: "Uncovered components",
+    VIO_MODE_RECOMMENDED: "Fresh start",
+}
+CHAT_SPEC_PROMPT = (
+    "How do you want your specs? Pick one:\n\n"
+    "- **Run all components**: every meaningful component without a spec (can take a long time)\n"
+    "- **Customised**: you choose a class or function, or how many components\n"
+    "- **Uncovered components**: the next most important components without a spec; existing files are kept\n"
+    "- **Fresh start**: the most important components, replacing earlier generated files"
+)
+
+
+def _chat_repo_names() -> list:
+    if not REPOSITORIES_DIR.is_dir():
+        return []
+    return sorted(p.name for p in REPOSITORIES_DIR.iterdir() if p.is_dir() and not p.name.startswith("."))
+
+
+def _chat_vio_client():
+    """Connected VIO client, connecting on demand; None when unconfigured or unreachable."""
+    if st.session_state.get("vio_client") and st.session_state.get("vio_connected"):
+        return st.session_state["vio_client"]
+    client = VIOClient(base_url=st.session_state.get("vio_endpoint", ""))
+    if not client.is_configured:
+        return None
+    ok = client.ping()
+    st.session_state["vio_client"] = client
+    st.session_state["vio_connected"] = ok
+    return client if ok else None
+
+
+def _chat_prepare_repo(request: dict) -> tuple:
+    """Clone or locate the requested repository; returns (path, error)."""
+    try:
+        if request["repo_url"]:
+            valid, error = validate_repository_url(request["repo_url"])
+            if not valid:
+                return "", error
+            path = ensure_repository(request["repo_url"], REPOSITORIES_DIR)
+            url = request["repo_url"]
+        else:
+            path = REPOSITORIES_DIR / request["repo_name"]
+            url = ""
+            if not path.is_dir():
+                return "", f"`{request['repo_name']}` is not cloned yet. Send me its GitHub URL."
+    except (ValueError, RuntimeError, OSError) as error:
+        return "", f"I couldn't prepare the repository: {error}"
+    st.session_state.update(repository_name=Path(path).name, repository_path=str(path),
+                            repository_url=url, clone_status="Ready")
+    return str(path), ""
+
+
+def _chat_run_summary(run_state: dict) -> str:
+    if run_state.get("error"):
+        return f"The run stopped: {run_state['error']}"
+    master = AGENTS["master"]
+    models = st.session_state.get("models", {})
+    passed, failed, errors = (
+        sum(data.get(key, 0) for agent, data in models.items() if agent != master and "passed" in data)
+        for key in ("passed", "failed", "errors")
+    )
+    text = f"{'Cancelled early' if run_state.get('cancelled') else 'Finished'}: {passed} tests passed, {failed} failed, {errors} errors."
+    runnable, fully, review = _chat_script_totals(models)
+    text += f" {fully} of {runnable} runnable scripts pass completely" + (f"; {review} flagged for review." if review else ".")
+    coverage = run_state.get("coverage") or {}
+    if coverage and not coverage.get("error"):
+        text += f" Source coverage from passing tests is {coverage['percent']}% (target {coverage['target']:g}%)."
+    return text + " I can re-run failed specs or continue with more components. Your downloads are below."
+
+
+def _chat_script_totals(models: dict) -> tuple:
+    """(runnable scripts, fully passing scripts, scripts flagged for review) across all writer agents."""
+    workers = [data for agent, data in models.items() if agent != AGENTS["master"] and "passed" in data]
+    return tuple(sum(data.get(key, 0) for data in workers) for key in ("runnable", "fully_passing", "needs_review"))
+
+
+def _chat_status() -> str:
+    run_state = st.session_state.get("vio_run_state") or {}
+    if run_state.get("active"):
+        total = run_state.get("total")
+        return (f"Working: {run_state.get('done', 0)} of {total} specifications done." if total
+                else "Still preparing the component queue.")
+    if run_state.get("finished"):
+        return _chat_run_summary(run_state)
+    return "Nothing has run yet. Tell me what to test and I'll start."
+
+
+def _chat_rerun(request: dict) -> str:
+    if _chat_vio_client() is None:
+        return "I can't reach VIO, so I can't re-run specs. Check VIO_API_KEY in your .env."
+    path = ""
+    if request["repo_url"] or request["repo_name"]:
+        path, error = _chat_prepare_repo(request)
+        if error:
+            return error
+    path = path or st.session_state.get("repository_path", "")
+    count = _vio_rerunnable_count(path)
+    if not count:
+        return "There are no failed specs to re-run."
+    if (st.session_state.get("vio_run_state") or {}).get("active"):
+        return "A run is already in progress; I'll report when it finishes."
+    run_vio_rerun_failed(path, parallel=True)
+    st.session_state.update(chat_run_pending=True, chat_stage="running")
+    return f"Re-running {count} failed specs. Progress is below."
+
+
+def _chat_run_ollama(path: str, types: list, mode: str, pending: list, limit: int) -> str:
+    """Run the local Ollama pipeline synchronously and return a summary."""
+    state = st.session_state
+    if not initialize_orchestrator():
+        state.update(chat_stage="engine")
+        state["chat_request"]["engine"] = ""
+        return "I couldn't reach Ollama. Start it, or choose VIO instead."
+    if mode == VIO_MODE_RECOMMENDED:
+        _vio_clear_artifacts(path)
+    run_test_orchestration(types, components=pending[:limit] if limit else pending, inline_extras=False)
+    results = state.get("execution_results") or {}
+    failed = sum(result["status"] == "FAILED" for result in results.values())
+    text = f"Finished: {len(results)} components processed, {failed} with failures."
+    coverage = state.get("last_coverage") or {}
+    if coverage and not coverage.get("error"):
+        text += f" Source coverage is {coverage['percent']}%."
+    state["chat_stage"] = "done"
+    return text + " Your downloads are below."
+
+
+def _chat_start(request: dict) -> str:
+    """Resolve the repository and components, then launch the chosen engine."""
+    state = st.session_state
+    path, error = _chat_prepare_repo(request)
+    if error:
+        request.update(repo_url="", repo_name="")
+        state["chat_stage"] = "intake"
+        return error + " Please share the GitHub repository link again."
+    if request["engine"] == "vio":
+        if (state.get("vio_run_state") or {}).get("active"):
+            return "A run is already in progress; I'll report when it finishes."
+        if _chat_vio_client() is None:
+            request["engine"] = ""
+            state["chat_stage"] = "engine"
+            return "I can't reach VIO. Check VIO_API_KEY in your .env, or choose Ollama."
+
+    target, choice = request["target"], request["mode"]
+    mode = VIO_MODE_CONTINUE if choice == CHAT_CUSTOM else choice
+    components = discover_components(path)
+    already_specified = bool(spec_slugs(path))
+    if target:
+        needle = target.lower()
+        matching = [c for c in components if needle in (c["module"] + "." + c["symbol"]).lower()]
+        if not matching:
+            request.update(target="", mode="")
+            state["chat_stage"] = "specs"
+            return (f"I couldn't find a class or function matching `{target}` in {Path(path).name}. "
+                    "Choose how to select components, or name another one.")
+        components, mode = matching, VIO_MODE_CONTINUE
+    pending = select_components(path, components, resume=mode != VIO_MODE_RECOMMENDED)["pending"]
+    if not pending:
+        request.update(target="", max_components=0, mode="", confirmed=False)
+        state["chat_stage"] = "done"
+        return "Every matching component already has a specification. I can re-run failed ones or pick others."
+
+    if choice == VIO_MODE_ALL and not request.get("confirmed"):
+        state["chat_stage"] = "confirm"
+        return (f"Run all will specify {len(pending)} components in `{Path(path).name}`. Each one needs several "
+                "model requests, so this can take a long time. Start?")
+
+    limit = 0 if target or mode == VIO_MODE_ALL else (request["max_components"] or 20)
+    types = request["test_types"]
+    label = f"`{Path(path).name}`"
+    scope = CHAT_SPEC_LABELS.get(choice, "").lower()
+    request.update(target="", max_components=0, mode="", confirmed=False)
+    if request["engine"] == "ollama":
+        return _chat_run_ollama(path, types, mode, pending, limit)
+
+    run_vio_orchestration(types, parallel=True, max_components=limit, mode=mode, target=target)
+    state.update(chat_run_pending=True, chat_stage="running")
+    reply = chat_assistant.describe_request({**request, "test_types": types, "target": target}, label)
+    reply = reply.replace("Generating", "Generating with VIO", 1)
+    if scope:
+        reply += f" Scope: {scope}."
+    if mode == VIO_MODE_RECOMMENDED and already_specified:
+        reply += " This replaces earlier generated files."
+    return reply + " I'll report back when it's done."
+
+
+def _chat_queue_text(request: dict) -> str:
+    """Component counts for the requested repository, or the error that blocks them."""
+    path, error = _chat_prepare_repo(request)
+    if error:
+        request.update(repo_url="", repo_name="")
+        st.session_state["chat_stage"] = "intake"
+        return error + " Please share the GitHub repository link again."
+    queue = select_components(path, discover_components(path), resume=True)
+    return (f"`{Path(path).name}` has {queue['meaningful']} meaningful components: {len(queue['pending'])} still "
+            f"need a spec, {queue['already_specified']} already have one, and {len(queue['excluded'])} are "
+            "skipped as trivial or internal.")
+
+
+def _chat_advance() -> str:
+    """Ask for whatever is still missing, or start the run; returns the assistant's message."""
+    state = st.session_state
+    request = state["chat_request"]
+    if not (request["repo_url"] or request["repo_name"]):
+        state["chat_stage"] = "intake"
+        return chat_assistant.missing_question(request, _chat_repo_names())
+    if not request["test_types"]:
+        state["chat_stage"] = "intake"
+        return "Which test types do you need (one or more): unit, integration, e2e or security?"
+    if not request["engine"]:
+        state["chat_stage"] = "engine"
+        return "How would you like to generate the tests?"
+    if not request["mode"]:
+        counts = _chat_queue_text(request)
+        if not (request["repo_url"] or request["repo_name"]):
+            return counts
+        state["chat_stage"] = "specs"
+        types = request["test_types"]
+        summary = f"Test types: {chat_assistant.type_label(types)}."
+        if len(types) > 1:
+            summary += " They are combined in one spec and one script per component."
+        return f"{summary} {counts}\n\n{CHAT_SPEC_PROMPT}"
+    if request["mode"] == CHAT_CUSTOM and not (request["target"] or request["max_components"]):
+        state["chat_stage"] = "custom"
+        return "Type the class or function to cover, or how many components (for example `Parser` or `10`)."
+    return _chat_start(request)
+
+
+def _chat_set(**changes) -> str:
+    st.session_state["chat_request"].update(changes)
+    return _chat_advance()
+
+
+def _chat_new_repository() -> str:
+    engine = st.session_state["chat_request"]["engine"]
+    st.session_state["chat_request"] = {**chat_assistant.new_request(), "engine": engine}
+    st.session_state["chat_stage"] = "intake"
+    return "Sure. Share the GitHub repository link and the type of tests you need."
+
+
+def _chat_reply(text: str) -> str:
+    state = st.session_state
+    request = state["chat_request"]
+    names = _chat_repo_names()
+    client = state.get("vio_client") if state.get("vio_connected") else None
+    local = chat_assistant.interpret_locally(text, names)
+    understood = any(local.get(key) for key in ("repo_url", "repo_name", "test_types", "engine")) or local["intent"] != "other"
+    ask = (lambda prompt, system=None: client.chat(
+        AGENTS["unit"], prompt, system=system, max_tokens=400, temperature=0.0)) if client and not understood else None
+    parsed = chat_assistant.interpret(text, state["chat_messages"][:-1], names, request, ask)
+
+    if state.get("chat_stage") == "custom" and not (parsed.get("target") or parsed.get("max_components")):
+        word = text.strip().strip("`")
+        if word.isdigit():
+            parsed["max_components"] = int(word)
+        elif re.fullmatch(r"[A-Za-z_][\w.]*", word):
+            parsed["target"] = word
+    if state.get("chat_stage") == "confirm" and re.fullmatch(
+            r"(yes|y|ok|okay|start|go|go ahead|proceed|sure)[.!]?", text.strip().lower()):
+        return _chat_set(confirmed=True)
+    if (parsed.get("target") or parsed.get("max_components")) and not parsed.get("mode"):
+        parsed["mode"] = CHAT_CUSTOM
+
+    has_fields = any(parsed.get(key) for key in (
+        "repo_url", "repo_name", "test_types", "target", "max_components", "mode", "engine"))
+    intent = "generate" if parsed["intent"] == "other" and has_fields else parsed["intent"]
+    if intent == "status":
+        return _chat_status()
+    if intent == "count":
+        request = chat_assistant.merge_request(request, parsed)
+        state["chat_request"] = request
+        if not (request["repo_url"] or request["repo_name"]):
+            return chat_assistant.missing_question(request, names)
+        with st.spinner("Counting components…"):
+            return _chat_queue_text(request)
+    if intent == "other":
+        return parsed.get("reply") or chat_assistant.HELP_TEXT
+
+    request = chat_assistant.merge_request(request, parsed)
+    state["chat_request"] = request
+    if intent == "rerun":
+        return _chat_rerun(request)
+    return _chat_advance()
+
+
+def _zip_folder(folder: Path, pattern: str) -> bytes:
+    files = sorted(folder.glob(pattern))
+    if not files:
+        return b""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in files:
+            archive.write(path, path.name)
+    return buffer.getvalue()
+
+
+def _render_export_menu(repo_path: str) -> None:
+    """One Export menu for everything the last run wrote under tests/."""
+    tests = Path(repo_path) / "tests"
+    name = Path(repo_path).name
+    scripts = _zip_folder(tests / "test_scripts", "*_test.py")
+    specs = _zip_folder(tests / "specs", "*.md")
+    if not (scripts or specs):
+        return
+    files = [
+        ("Everything (specs, scripts, results)", _build_aligned_bundle(repo_path), f"{name}_tests.zip", "application/zip"),
+        ("Test scripts", scripts, f"{name}_scripts.zip", "application/zip"),
+        ("Specifications", specs, f"{name}_specs.zip", "application/zip"),
+    ]
+    for label, file_name, mime in (("Traceability (JSON)", "spec_traceability.json", "application/json"),
+                                   ("Run history (JSON)", "run_history.json", "application/json"),
+                                   ("Final report", "final_report.md", "text/markdown")):
+        path = tests / file_name
+        if path.exists() and path.stat().st_size:
+            files.append((label, path.read_bytes(), file_name, mime))
+    with st.popover("⬇️ Export", use_container_width=False):
+        for label, data, file_name, mime in files:
+            st.download_button(label, data, file_name, mime, key=f"export_{file_name}", use_container_width=True)
+        single = [f"test_scripts/{p.name}" for p in sorted((tests / "test_scripts").glob("*_test.py"))]
+        single += [f"specs/{p.name}" for p in sorted((tests / "specs").glob("*.md"))]
+        picked = st.selectbox("A single file", [""] + single, key="export_single_file",
+                              format_func=lambda value: value or "Select a script or spec")
+        if picked:
+            st.download_button(f"Download {picked.split('/')[-1]}", (tests / picked).read_bytes(),
+                               file_name=picked.split("/")[-1], key="export_dl_single")
+
+
+def _render_chat_options(slot) -> None:
+    """Buttons for the current stage; a click runs the matching action and refreshes the page."""
+    state = st.session_state
+    stage = state.get("chat_stage")
+    request = state["chat_request"]
+    options = []
+    if stage == "engine":
+        options = [("Test with VIO", lambda: _chat_set(engine="vio")),
+                   ("Test with Ollama", lambda: _chat_set(engine="ollama"))]
+    elif stage == "specs":
+        options = [(label, (lambda key=key: _chat_set(mode=key))) for key, label in CHAT_SPEC_LABELS.items()]
+    elif stage == "confirm":
+        options = [("Start run", lambda: _chat_set(confirmed=True)),
+                   ("Choose differently", lambda: _chat_set(mode="", confirmed=False))]
+    elif stage == "done":
+        options = [("Uncovered components", lambda: _chat_set(mode=VIO_MODE_CONTINUE))]
+        if request["engine"] == "vio" and _vio_rerunnable_count(state.get("repository_path")):
+            options.append(("Re-run failed specs", lambda: _chat_rerun(request)))
+        options.append(("Test another repository", _chat_new_repository))
+    clicked = None
+    with slot.container():
+        for column, (label, action) in zip(st.columns(len(options) or 1), options):
+            if column.button(label, key=f"chat_opt_{stage}_{label}", use_container_width=True):
+                clicked = (label, action)
+    if not clicked:
+        return
+    slot.empty()
+    label, action = clicked
+    state["chat_messages"].append({"role": "user", "content": label})
+    with st.chat_message("user"):
+        st.markdown(label)
+    with st.chat_message("assistant"):
+        with st.spinner("Working…"):
+            reply = action()
+    state["chat_messages"].append({"role": "assistant", "content": reply})
+    st.rerun()
+
+
+def _chat_stage_label(run_state: dict) -> str:
+    if run_state.get("error"):
+        return "Stopped"
+    if run_state.get("finished"):
+        return "Cancelled" if run_state.get("cancelled") else "Finished"
+    if run_state.get("cancel"):
+        return "Cancelling"
+    if run_state.get("paused"):
+        return "Paused"
+    current = run_state.get("current") or []
+    if any("(raising coverage)" in name for name in current):
+        return f"Raising coverage to {COVERAGE_TARGET:g}%"
+    total = run_state.get("total")
+    if total and run_state.get("done", 0) >= total:
+        return "Measuring coverage and writing the report"
+    return "Writing and running tests" if total else "Preparing the component queue"
+
+
+def _chat_component_rows(models: dict, coverage: dict) -> list:
+    master = AGENTS["master"]
+    components = [item for agent, data in models.items() if agent != master for item in data.get("components", [])]
+    return results_view.component_rows(components, coverage, models.get(master, {}).get("plan_failures", []))
+
+
+def _render_component_results(models: dict, coverage: dict) -> None:
+    """Per-component table: honest status, tests, coverage and why/how to fix, with a status filter."""
+    rows = _chat_component_rows(models, coverage)
+    if not rows:
+        return
+    counts = results_view.status_counts(rows)
+    shown = [status for status in results_view.STATUSES if counts[status]]
+    st.markdown("**Results by component**")
+    st.caption(" - ".join(f"{counts[status]} {status.lower()}" for status in shown))
+    picked = st.multiselect("Show", results_view.STATUSES, default=[s for s in shown if s != "Passing"] or shown,
+                            key="results_filter", label_visibility="collapsed")
+    st.dataframe([row for row in rows if row["Status"] in picked], hide_index=True, width="stretch")
+
+
+def _render_run_summary(models: dict, run_state: dict) -> None:
+    """Totals, coverage target and script-level pass counts shared by the chat and results views."""
+    master = AGENTS["master"]
+    workers = [data for agent, data in models.items() if agent != master and "passed" in data]
+    coverage = run_state.get("coverage") or {}
+    columns = st.columns(4)
+    columns[0].metric("Specs", sum(len([c for c in d.get("components", []) if c.get("spec")]) for d in workers))
+    columns[1].metric("Passed", sum(d.get("passed", 0) for d in workers))
+    columns[2].metric("Failed", sum(d.get("failed", 0) + d.get("errors", 0) for d in workers))
+    columns[3].metric("Coverage", f"{coverage['percent']}%" if coverage and not coverage.get("error") else "-")
+    runnable, fully, review = _chat_script_totals(models)
+    if runnable:
+        st.caption(f"{fully} of {runnable} runnable scripts pass completely"
+                   + (f" - {review} flagged for review" if review else "")
+                   + (" - coverage counts passing tests only" if coverage and not coverage.get("error") else ""))
+    if coverage and not coverage.get("error"):
+        met = coverage["target_met"]
+        (st.success if met else st.warning)(
+            f"Coverage target {coverage['target']:g}% {'reached' if met else 'not reached'}.")
+    elif coverage.get("error") and run_state.get("finished"):
+        st.info(f"Coverage was not measured: {coverage['error']}")
+
+
+def _render_run_tracker(run_state: dict) -> None:
+    """Phase strip, progress with ETA, per-stage counts and pause/cancel controls."""
+    active = run_state.get("active")
+    position = run_progress.phase_index(run_state)
+    steps = [f"{'✅' if index < position else '🔄' if index == position else '⚪'} {name}"
+             for index, name in enumerate(run_progress.PHASES)]
+    st.markdown("  →  ".join(f"**{step}**" if index == position else step for index, step in enumerate(steps)))
+    total, done = run_state.get("total"), run_state.get("done", 0)
+    if active and total:
+        eta = run_progress.eta_seconds(run_state)
+        st.progress(min(done / total, 1.0), text=f"{done} of {total} specifications done"
+                    + (f" - about {run_progress.format_duration(eta)} left" if eta else ""))
+    counts = run_progress.stage_counts(run_state)
+    if active and counts:
+        st.caption(" · ".join(f"{run_progress.STAGE_LABELS[stage]}: {count}" for stage, count in counts.items()))
+    working = [f"`{name.split(' (')[0]}` ({run_progress.STAGE_LABELS.get(stage, stage).lower()})"
+               for name, stage in list((run_state.get("stages") or {}).items())[:4]]
+    if active and working:
+        st.caption("Working on: " + ", ".join(working))
+    if not active:
+        return
+    if run_state.get("cancel"):
+        st.info("Stopping after the components in progress finish. Finished work is saved.")
+        return
+    if run_state.get("paused"):
+        st.warning("Paused: running components finish, then no new ones start.")
+    pause, cancel, _ = st.columns([1, 1, 4])
+    if pause.button("▶ Resume" if run_state.get("paused") else "⏸ Pause", key="run_pause", use_container_width=True):
+        run_progress.toggle_pause(run_state)
+        st.rerun(scope="app")
+    if cancel.button("⏹ Cancel", key="run_cancel", use_container_width=True):
+        run_progress.request_cancel(run_state)
+        st.rerun(scope="app")
+
+
+def _render_chat_status() -> None:
+    """Chat view status: stage tracker, totals and a pointer to the Results page."""
+    state = st.session_state
+    run_state = state.get("vio_run_state") or {}
+    st.markdown(f"**Status:** {_chat_stage_label(run_state)}")
+    _render_run_tracker(run_state)
+    if run_state.get("error"):
+        st.error(f"The run stopped: {run_state['error']}")
+    _render_run_summary(state.get("models", {}), run_state)
+    if run_state.get("finished"):
+        st.caption("Open the Results view for the component table, side-by-side tests, coverage gaps and history.")
+
+
+@st.fragment(run_every=1)
+def _chat_status_live() -> None:
+    _render_chat_status()
+    if not (st.session_state.get("vio_run_state") or {}).get("active"):
+        st.rerun(scope="app")
+
+
+def render_chat_status_panel() -> None:
+    if (st.session_state.get("vio_run_state") or {}).get("active"):
+        _chat_status_live()
+    else:
+        _render_chat_status()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _component_sources(repo_path: str) -> dict:
+    return {c["module"] + "." + c["symbol"]: c["source_path"] for c in discover_components(repo_path)}
+
+
+def _saved_run_repositories() -> list:
+    if not REPOSITORIES_DIR.is_dir():
+        return []
+    return sorted(p.name for p in REPOSITORIES_DIR.iterdir() if (p / "tests" / "vio_run_state.json").is_file())
+
+
+def _restore_last_run(repo_path: str) -> bool:
+    """Rebuild the results view from the last saved run of a repository, e.g. after restarting the app."""
+    saved = _vio_load_state(repo_path)
+    if not saved:
+        return False
+
+    class _NoUsage:
+        token_usage: dict = {}
+
+    per_agent: dict = {}
+    plan_failures: list = []
+    for item in saved["results"]:
+        (per_agent.setdefault(item["writer"], []) if item.get("writer") else plan_failures).append(item)
+    models = {
+        agent: _vio_aggregate_agent(
+            agent, [t for t in saved["types"] if TYPE_TO_AGENT.get(t, AGENTS["unit"]) == agent], items,
+            _NoUsage(), "done")
+        for agent, items in per_agent.items()
+    }
+    report_file = Path(repo_path) / "tests" / "final_report.md"
+    report = report_file.read_text(encoding="utf-8") if report_file.is_file() else ""
+    models[AGENTS["master"]] = {
+        "status": "done", "task_type": "supervision", "tokens": 0, "validations": [], "report": report,
+        "plan_failures": [{"component": item["component"], "error": item.get("error", "")} for item in plan_failures],
+        "repo": str(repo_path),
+    }
+    coverage: dict = {}
+    tests = Path(repo_path) / "tests"
+    try:
+        found = summarize_coverage(repo_path, discover_components(repo_path),
+                                   tests / "coverage" / "coverage.json", tests / "test_scripts")
+        coverage = {**found, "target": COVERAGE_TARGET, "target_met": found["percent"] >= COVERAGE_TARGET, "rounds": 0}
+    except (OSError, ValueError, KeyError):
+        coverage = {}
+    st.session_state.update(
+        models=models, repository_path=str(repo_path),
+        vio_run_state={"active": False, "finished": True, "report": report, "error": "", "coverage": coverage,
+                       "ui_refreshed": True, "restored": True})
+    return True
+
+
+def _render_results_empty() -> None:
+    st.info("There are no results in this session yet. Start a run in the Chat view, or open a saved one.")
+    saved = _saved_run_repositories()
+    if not saved:
+        return
+    picked = st.selectbox("Saved results", saved, key="results_open")
+    if st.button("Open saved results", key="results_open_btn"):
+        if _restore_last_run(str(REPOSITORIES_DIR / picked)):
+            st.rerun()
+        st.error("The saved run for that repository could not be read.")
+
+
+def _render_side_by_side(models: dict) -> None:
+    """Each scenario of the specification next to the test that implements it and its pytest outcome."""
+    master = AGENTS["master"]
+    items = [item for agent, data in models.items() if agent != master
+             for item in data.get("components", []) if item.get("plan")]
+    if not items:
+        st.info("No stored specification scenarios for this run. Run again to see them here.")
+        return
+    items.sort(key=lambda item: (results_view.STATUSES.index(results_view.component_status(item)), item["component"]))
+    status = {item["component"]: results_view.component_status(item) for item in items}
+    name = st.selectbox("Component", [item["component"] for item in items], key="sbs_component",
+                        format_func=lambda value: f"{value} - {status[value].lower()}")
+    item = next(item for item in items if item["component"] == name)
+    only_failing = st.toggle("Only failing scenarios", key="sbs_failing")
+    if item.get("spec"):
+        st.caption(f"Specification: `{Path(item['spec']).name}`"
+                   + (f" - script: `{Path(item['script']).name}`" if item.get("script") else ""))
+    icons = {"PASSED": "✅", "FAILED": "❌", "ERROR": "❌"}
+    rows = [row for row in side_by_side.scenario_rows(item)
+            if not only_failing or row["status"] in ("FAILED", "ERROR", "NOT RUN")]
+    if not rows:
+        st.success("Every scenario of this component passed.")
+    for row in rows:
+        with st.container(border=True):
+            spec_col, test_col, result_col = st.columns([3, 4, 3])
+            spec_col.markdown(f"**{row['id']} · {row['category']}**  \n*Inputs:* {row['inputs']}  \n"
+                              f"*Expected:* {row['expected']}")
+            if row["evidence"]:
+                spec_col.caption("Source evidence: " + row["evidence"][:240])
+            test_col.code(row["code"] or "# test function not found in the script", language="python")
+            result_col.markdown(f"{icons.get(row['status'], '⚪')} **{row['status'].title()}**")
+            if row["reason"]:
+                result_col.code(row["reason"], language="text")
+    output = (item.get("execution") or {}).get("output")
+    if output:
+        with st.expander("Full pytest output"):
+            st.code(output, language="text")
+
+
+def _render_coverage_gaps(coverage: dict, repo_path: str) -> None:
+    """Uncovered source lines per component, with an action that writes tests for them."""
+    if not coverage or coverage.get("error"):
+        st.info("Coverage was not measured for this run"
+                + (f": {coverage['error']}" if coverage else "."))
+        return
+    gaps = [row for row in coverage["components"] if row.get("percent") is not None and row["percent"] < 100]
+    if not gaps:
+        st.success("Every measured component is fully covered.")
+        return
+    by_name = {row["component"]: row for row in gaps}
+    picked = st.selectbox("Component", list(by_name), key="gap_component",
+                          format_func=lambda value: f"{value} - {by_name[value]['percent']}%")
+    row = by_name[picked]
+    st.caption(f"Target {coverage.get('target', COVERAGE_TARGET):g}% overall. Lines marked ! are not run by any passing test.")
+    source = _component_sources(repo_path).get(picked)
+    try:
+        lines = (Path(repo_path) / source).read_text(encoding="utf-8").splitlines() if source else []
+    except (OSError, UnicodeError):
+        lines = []
+    uncovered = row.get("missing_lines") or coverage_view.parse_ranges(row.get("uncovered_lines"))
+    if lines and uncovered:
+        st.code(coverage_view.annotated_source(lines, uncovered), language="text")
+    elif row.get("uncovered_lines"):
+        st.write(f"Uncovered lines: {row['uncovered_lines']}")
+    if not row["specified"]:
+        st.caption("This component has no specification yet. Use 'Uncovered components' in the Chat view to write one.")
+    elif st.button("Add tests for these lines", key="gap_topup"):
+        error = run_vio_topup(repo_path, row)
+        if error:
+            st.error(error)
+        else:
+            st.rerun()
+
+
+def _render_history(repo_path: str) -> None:
+    runs = run_history.load(repo_path)
+    if not runs:
+        st.info("No runs have been recorded for this repository yet.")
+        return
+    st.dataframe(run_history.rows(runs), hide_index=True, width="stretch")
+    if len(runs) < 2:
+        return
+    diff = run_history.compare(runs[-2], runs[-1])
+    st.markdown("**Latest run compared with the one before**")
+    columns = st.columns(3)
+    latest = runs[-1]
+    columns[0].metric("Coverage", f"{latest['coverage']}%" if latest["coverage"] is not None else "-",
+                      delta=diff["coverage_delta"])
+    columns[1].metric("Tests passed", latest["passed"], delta=diff["passed_delta"])
+    columns[2].metric("Tests failed", latest["failed"], delta=diff["failed_delta"], delta_color="inverse")
+    for label, moves in (("Improved", diff["improved"]), ("Got worse", diff["regressed"])):
+        if moves:
+            st.markdown(f"**{label}**")
+            for name, before, after in moves:
+                st.markdown(f"- `{name}`: {before} → {after}")
+    if diff["new"]:
+        st.caption(f"{len(diff['new'])} component(s) are new in the latest run.")
+
+
+def _results_content() -> None:
+    state = st.session_state
+    run_state = state.get("vio_run_state") or {}
+    models = state.get("models", {})
+    coverage = run_state.get("coverage") or {}
+    repo_path = state.get("repository_path", "")
+    st.markdown(f"**Status:** {_chat_stage_label(run_state)}")
+    _render_run_tracker(run_state)
+    if run_state.get("error"):
+        st.error(f"The run stopped: {run_state['error']}")
+    topup = run_state.get("topup_summary")
+    if run_state.get("finished") and topup:
+        st.info(f"Coverage top-up for `{topup['component']}`: {topup['result'] or 'no change'}.")
+    if run_state.get("cancelled"):
+        st.warning("This run was cancelled. Finished components are saved; continue from the Chat view.")
+    _render_run_summary(models, run_state)
+    _render_component_results(models, coverage)
+    if run_state.get("active"):
+        return
+    _render_export_menu(repo_path)
+    sbs, gaps, history, report = st.tabs(["Side by side", "Coverage gaps", "History", "Report"])
+    with sbs:
+        _render_side_by_side(models)
+    with gaps:
+        _render_coverage_gaps(coverage, repo_path)
+    with history:
+        _render_history(repo_path)
+    with report:
+        summary = run_state.get("rerun_summary")
+        if summary:
+            st.write(f"Re-run: {summary['fixed']} of {summary['attempted']} failed specs now pass.")
+        st.markdown(run_state.get("report") or "No final report was written for this run.")
+
+
+@st.fragment(run_every=1)
+def _results_live() -> None:
+    _results_content()
+    if not (st.session_state.get("vio_run_state") or {}).get("active"):
+        st.rerun(scope="app")
+
+
+def render_results_page() -> None:
+    """Review page: live tracker while running, then table, side-by-side tests, coverage gaps and history."""
+    state = st.session_state
+    run_state = state.get("vio_run_state") or {}
+    if run_state.get("active"):
+        _results_live()
+    elif any("passed" in data for data in state.get("models", {}).values()):
+        _results_content()
+    else:
+        _render_results_empty()
+
+
+def render_chat_workspace() -> None:
+    """Free-text chat front end for the VIO pipeline."""
+    state = st.session_state
+    state.setdefault("chat_messages", [{"role": "assistant", "content": CHAT_GREETING}])
+    state.setdefault("chat_request", chat_assistant.new_request())
+    state.setdefault("chat_stage", "intake")
+
+    run_state = state.get("vio_run_state") or {}
+    if state.get("chat_run_pending") and run_state.get("finished"):
+        state.update(chat_run_pending=False, chat_stage="done")
+        state["chat_messages"].append({"role": "assistant", "content": _chat_run_summary(run_state)})
+
+    for message in state["chat_messages"]:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if state["chat_request"]["engine"] == "vio" and state.get("vio_run_state"):
+        render_chat_status_panel()
+    if state["chat_stage"] == "done":
+        if state["chat_request"]["engine"] == "ollama":
+            render_coverage_panel(state.get("last_coverage"))
+        _render_export_menu(state.get("repository_path", ""))
+
+    _render_chat_options(st.empty())
+
+    text = st.chat_input("Type your message…")
+    if text:
+        state["chat_messages"].append({"role": "user", "content": text})
+        with st.chat_message("user"):
+            st.markdown(text)
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking…"):
+                reply = _chat_reply(text)
+        state["chat_messages"].append({"role": "assistant", "content": reply})
+        st.rerun()
+
+    if len(state["chat_messages"]) > 1 and st.button("New conversation", key="chat_clear"):
+        state.update(chat_messages=[{"role": "assistant", "content": CHAT_GREETING}],
+                     chat_request=chat_assistant.new_request(), chat_stage="intake")
+        st.rerun()
 
 
 def main() -> None:
@@ -3327,13 +5083,13 @@ def main() -> None:
     Manages the complete workflow:
     1. Repository input and cloning
     2. Test prompt generation
-    3. Approval gate with clipboard/VS Code automation
+    3. Approval gate with clipboard automation
     4. Results collection and display
     """
     # Configure Streamlit page settings
     st.set_page_config(
-        page_title="Enterprise Test Generator",
-        page_icon="🧪",
+        page_title="TestGenie",
+        page_icon="🧞",
         layout="wide",
         initial_sidebar_state="expanded",
     )
@@ -3344,16 +5100,25 @@ def main() -> None:
     # Apply Aumovio theme (orange + deep purple; dark default, light toggle)
     st.markdown(aumovio_css(st.session_state.get("theme", "dark")), unsafe_allow_html=True)
 
-    # Mode gate — pick VIO or Ollama before showing any workspace
+    # Landing page first; the chat then asks which engine to use
     if st.session_state.get("mode") is None:
         render_mode_gate()
         return
 
-    # Persistent top bar (brand, mode badge, theme toggle, change mode)
     render_top_bar()
 
-    # VIO workspace returns early; Ollama continues with the existing flow below
-    if st.session_state.get("mode") == "vio":
+    # Chat and VIO classic return early; Ollama classic continues with the existing flow below
+    view = st.radio("View", [VIEW_CHAT, VIEW_RESULTS, VIEW_ADVANCED], horizontal=True,
+                    key="app_view", label_visibility="collapsed")
+    if view == VIEW_CHAT:
+        render_chat_workspace()
+        return
+    if view == VIEW_RESULTS:
+        render_results_page()
+        return
+    advanced = st.radio("Advanced workspace", ["🛠️ Classic VIO", "🖥️ Classic Ollama"], horizontal=True,
+                        key="app_advanced")
+    if advanced == "🛠️ Classic VIO":
         render_vio_workspace()
         return
 
@@ -3381,6 +5146,33 @@ def main() -> None:
 
     # Display repository information status
     st.markdown("### Repository information")
+    details = st.columns(4)
+    with details[0]:
+        status_badge("Repository Name", st.session_state["repository_name"] or "—", "◈")
+    with details[1]:
+        status_badge("Clone Status", st.session_state["clone_status"], "↻")
+    with details[2]:
+        status_badge("Prompt Status", st.session_state["prompt_status"], "✓")
+    with details[3]:
+        status_badge("Local Path", st.session_state["repository_path"] or "—", "⌂")
+
+    if st.session_state["generated_prompt"] and st.session_state["approval_status"] == "Pending":
+        st.markdown("---")
+        st.markdown("### 📝 Generated Test_Prompt.md")
+        with st.expander("📋 View Full Prompt", expanded=False):
+            st.markdown(st.session_state["generated_prompt"])
+        st.download_button(
+            "📥 Download Test_Prompt.md",
+            data=st.session_state["generated_prompt"],
+            file_name="Test_Prompt.md",
+            mime="text/markdown",
+        )
+        display_approval_gate()
+
+    if st.session_state["proceed_clicked"]:
+        st.markdown("---")
+        display_orchestrator_section()
+        display_results_section()
 
 
 @st.fragment(run_every=1)
@@ -3388,6 +5180,11 @@ def render_vio_results_panel() -> None:
     """Refresh agent status and details without rerunning the main script."""
     models = st.session_state.get("models", {})
     run_state = st.session_state.get("vio_run_state", {})
+
+    # Buttons outside this fragment only re-evaluate `disabled` on a full rerun, so trigger one when a run ends.
+    if run_state.get("finished") and not run_state.get("ui_refreshed"):
+        run_state["ui_refreshed"] = True
+        st.rerun(scope="app")
 
     st.markdown("#### Agent Branches")
     st.caption("The diagram shows agent status. Use the agent buttons below to view details.")
@@ -3397,10 +5194,28 @@ def render_vio_results_panel() -> None:
 
     if run_state.get("active"):
         st.info("VIO generation is running in the background. Agent selections and results update live.")
+        if run_state.get("total"):
+            done, total = run_state.get("done", 0), run_state["total"]
+            st.progress(min(done / total, 1.0), text=f"{done} of {total} specifications completed")
+            if run_state.get("current"):
+                st.caption("Working on: " + ", ".join(run_state["current"][:4]))
     elif run_state.get("error"):
         st.error(f"VIO generation stopped: {run_state['error']}")
     elif run_state.get("finished"):
         st.success("VIO generation complete.")
+        if run_state.get("bundle"):
+            st.download_button(
+                "📦 Download aligned bundle (specs + scripts + pytest results)",
+                data=run_state["bundle"], file_name="vio_aligned_tests.zip",
+                mime="application/zip", key="dl_vio_bundle",
+            )
+        render_coverage_panel(run_state.get("coverage"))
+        summary = run_state.get("rerun_summary")
+        if summary:
+            st.markdown("#### Re-run of failed specs")
+            st.write(f"{summary['fixed']} of {summary['attempted']} failed specs now pass.")
+            for item in summary["needs_review"]:
+                st.warning(f"{item['component']}: {item['reason'] or 'still failing'}")
 
     ran = [model for model in models.values() if model.get("results") is not None or "passed" in model]
     if ran:
@@ -3408,12 +5223,13 @@ def render_vio_results_panel() -> None:
         total_failed = sum(model.get("failed", 0) for model in ran)
         total_errors = sum(model.get("errors", 0) for model in ran)
         total_tokens = sum(model.get("tokens", 0) for model in ran)
+        total_specs = sum(len([c for c in model.get("components", []) if c.get("spec")]) for model in ran)
         st.markdown("#### Results")
-        columns = st.columns(4)
+        columns = st.columns(5)
         for column, label, value in zip(
             columns,
-            ("Passed", "Failed", "Errors", "Tokens"),
-            (total_passed, total_failed, total_errors, total_tokens),
+            ("Specs", "Passed", "Failed", "Errors", "Tokens"),
+            (total_specs, total_passed, total_failed, total_errors, total_tokens),
         ):
             column.metric(label, value)
 
