@@ -27,6 +27,7 @@ Public API:
 from __future__ import annotations
 
 import os
+import random
 import time
 import json
 import logging
@@ -101,7 +102,7 @@ class VIOClient:
 
     # ------------------------------------------------------------------ low-level
     def _post(self, agent: str, messages: List[Dict], max_tokens: int,
-              temperature: float) -> dict:
+              temperature: float, timeout: Optional[int] = None) -> dict:
         """POST to /chat/completions. Returns a normalized result dict."""
         result = {"content": "", "tokens": 0, "time_s": 0.0, "ok": False, "error": ""}
         if not self.is_configured:
@@ -120,7 +121,7 @@ class VIOClient:
                 self.endpoint,
                 headers=self._headers(),
                 json=payload,
-                timeout=self.timeout,
+                timeout=timeout or self.timeout,
                 verify=False,
             )
             result["time_s"] = time.time() - start
@@ -136,7 +137,7 @@ class VIOClient:
             self.token_usage[agent] = self.token_usage.get(agent, 0) + result["tokens"]
             logger.info(f"✓ VIO {agent}: {result['tokens']} tok in {result['time_s']:.1f}s")
         except requests.exceptions.Timeout:
-            result["error"] = f"Timeout after {self.timeout}s"
+            result["error"] = f"Timeout after {timeout or self.timeout}s"
         except requests.exceptions.ConnectionError as e:
             result["error"] = f"Connection error: {e}"
         except Exception as e:  # pragma: no cover - defensive
@@ -185,12 +186,19 @@ class VIOClient:
 
     # ------------------------------------------------------------------ high-level
     def chat(self, agent: str, prompt: str, max_tokens: int = 1500,
-             temperature: float = 0.3, system: Optional[str] = None) -> dict:
+             temperature: float = 0.3, system: Optional[str] = None,
+             timeout: Optional[int] = None, retries: int = 0) -> dict:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        return self._post(agent, messages, max_tokens, temperature)
+        res = self._post(agent, messages, max_tokens, temperature, timeout)
+        for attempt in range(retries):
+            if res["ok"] or not res["error"].startswith(VIOGenerationAdapter.TRANSIENT_ERRORS):
+                break
+            time.sleep(4.0 * (2 ** attempt) * random.uniform(0.75, 1.25))
+            res = self._post(agent, messages, max_tokens, temperature, timeout)
+        return res
 
     def generate_test(self, agent: str, prompt: str, max_tokens: int = 2000) -> dict:
         """Generate a test file. `prompt` is the grounded prompt built by the app."""
@@ -207,7 +215,7 @@ class VIOClient:
             f"TEST:\n```python\n{test_code}\n```\n\n"
             f"REAL SOURCE:\n{source_context[:4000]}\n"
         )
-        res = self.chat(AGENTS["master"], prompt, max_tokens=200, temperature=0.0)
+        res = self.chat(AGENTS["master"], prompt, max_tokens=200, temperature=0.0, timeout=90, retries=2)
         verdict = {"level": "BRONZE", "reasons": "", "ok": res["ok"]}
         if res["ok"]:
             parsed = _safe_json(res["content"])
@@ -235,11 +243,60 @@ class VIOClient:
     def report(self, summary_text: str) -> dict:
         """Ask test_master for a concise, readable final report."""
         prompt = (
-            "Write a short, professional test-run report (Markdown) from this data. "
-            "Include an overview, pass/fail summary, notable failures, and next steps.\n\n"
-            f"{summary_text[:3000]}"
+            "Write a short, professional test-run report (Markdown) using ONLY the facts below. "
+            "Do not invent causes, numbers, tools or agent names. Report failed components exactly as "
+            "described: a component that failed for a transient gateway error is retryable with the "
+            "app's 'Re-run failed specs' button and must not be called untestable. Never present "
+            "'0 failed tests' as success when components have no passing tests. Include an overview, "
+            "pass/fail summary, notable failures with their stated reasons, and next steps that follow "
+            "directly from the facts.\n\n"
+            f"{summary_text[:4000]}"
         )
-        return self.chat(AGENTS["master"], prompt, max_tokens=800, temperature=0.3)
+        return self.chat(AGENTS["master"], prompt, max_tokens=800, temperature=0.3, timeout=90, retries=2)
+
+
+class VIOGenerationAdapter:
+    """Expose one VIO agent through the generate() interface used by the spec pipeline."""
+
+    TRANSIENT_ERRORS = ("HTTP 429", "HTTP 502", "HTTP 503", "HTTP 504", "Timeout", "Connection error")
+
+    def __init__(self, client: VIOClient, agent: str, timeout: int = 180, attempts: int = 3,
+                 backoff: float = 4.0):
+        self.client = client
+        self.agent = agent
+        self.timeout = timeout
+        self.attempts = attempts
+        self.backoff = backoff
+
+    def _pause(self, attempt: int, error: str) -> None:
+        # Jitter keeps parallel components from retrying a struggling gateway in lockstep.
+        if error.startswith(self.TRANSIENT_ERRORS):
+            time.sleep(self.backoff * (2 ** attempt) * random.uniform(0.75, 1.25))
+
+    def generate(self, model: str, prompt: str, format: str = "", options: Optional[dict] = None, **_):
+        from types import SimpleNamespace
+
+        system = (
+            "Respond with one valid JSON object only: no markdown fences and no commentary."
+            if format == "json" else None
+        )
+        max_tokens = int((options or {}).get("num_predict", 2000))
+        error = ""
+        for attempt in range(self.attempts):
+            res = self.client.chat(
+                self.agent, prompt, max_tokens=max_tokens, temperature=0.2,
+                system=system, timeout=self.timeout,
+            )
+            if res["ok"] and res["content"].strip():
+                metrics = SimpleNamespace(
+                    response_tokens=res["tokens"], total_time=res["time_s"],
+                    load_duration=0, prompt_eval_duration=0, eval_duration=0,
+                )
+                return res["content"], metrics
+            error = res["error"] or "empty response"
+            if attempt + 1 < self.attempts:
+                self._pause(attempt, error)
+        raise RuntimeError(f"VIO agent {self.agent} failed: {error}")
 
 
 def _safe_json(text: str) -> Optional[dict]:
