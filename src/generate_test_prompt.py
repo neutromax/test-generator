@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-TOOL_DIR = Path(__file__).resolve().parent.parent  # Point to root directory
+TOOL_DIR = Path(__file__).resolve().parent  # Point to src directory
 PROMPT_FILE = TOOL_DIR / "Test_Prompt.md"
 
 
