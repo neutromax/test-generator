@@ -80,4 +80,4 @@ ENV STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false
 COPY .streamlit/lambda.toml ${APP_DIR}/.streamlit/config.toml
 
 # Lambda entry point - runs Streamlit with Web Adapter
-CMD ["python", "-m", "awslambdaric", "lambda_handler.lambda_handler"]
+CMD ["python", "-m", "awslambdaric", "src.lambda_handler.lambda_handler"]

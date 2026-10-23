@@ -40,6 +40,19 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
 
+# Reduce repetitive transport-error spam (e.g., transient DNS failures) in logs.
+_LOG_THROTTLE_SECONDS = 20.0
+_last_error_log_at: Dict[str, float] = {}
+
+
+def _should_log_error(key: str) -> bool:
+    now = time.time()
+    last = _last_error_log_at.get(key, 0.0)
+    if (now - last) < _LOG_THROTTLE_SECONDS:
+        return False
+    _last_error_log_at[key] = now
+    return True
+
 # --- Agent registry -------------------------------------------------------
 # The value is what we send in the `model` field of the request.
 AGENTS: Dict[str, str] = {
@@ -127,7 +140,8 @@ class VIOClient:
             result["time_s"] = time.time() - start
             if resp.status_code != 200:
                 result["error"] = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                logger.error(f"✗ VIO {agent} {result['error']}")
+                if _should_log_error(f"http:{agent}:{resp.status_code}"):
+                    logger.error(f"✗ VIO {agent} {result['error']}")
                 return result
 
             data = resp.json()
@@ -139,11 +153,25 @@ class VIOClient:
         except requests.exceptions.Timeout:
             result["error"] = f"Timeout after {timeout or self.timeout}s"
         except requests.exceptions.ConnectionError as e:
-            result["error"] = f"Connection error: {e}"
+            msg = str(e)
+            # DNS failures are deterministic configuration/network issues; retries just spam logs.
+            if "Failed to resolve" in msg or "NameResolutionError" in msg or "getaddrinfo failed" in msg:
+                result["error"] = f"DNS error: {msg}"
+            else:
+                result["error"] = f"Connection error: {msg}"
         except Exception as e:  # pragma: no cover - defensive
             result["error"] = f"{type(e).__name__}: {e}"
         if result["error"]:
-            logger.error(f"✗ VIO {agent} failed: {result['error']}")
+            err = result["error"]
+            if err.startswith("DNS error"):
+                if _should_log_error(f"dns:{self.base_url}"):
+                    logger.warning(f"✗ VIO {agent} failed: {err}")
+            elif err.startswith("Connection error"):
+                if _should_log_error(f"conn:{self.base_url}"):
+                    logger.warning(f"✗ VIO {agent} failed: {err}")
+            else:
+                if _should_log_error(f"err:{agent}:{err[:120]}"):
+                    logger.error(f"✗ VIO {agent} failed: {err}")
         return result
 
     @staticmethod
@@ -184,6 +212,30 @@ class VIOClient:
         )
         return res["ok"]
 
+    def ping_detail(self) -> dict:
+        """Connectivity check with error details for UX and fast-fail decisions."""
+        if not self.is_configured:
+            return {"ok": False, "error": "VIO not configured (set VIO_API_BASE and VIO_API_KEY)."}
+        return self._post(
+            AGENTS["master"],
+            [{"role": "user", "content": "ping"}],
+            max_tokens=5,
+            temperature=0.0,
+        )
+
+    @staticmethod
+    def _is_retryable_error(error: str) -> bool:
+        if not error:
+            return False
+        if error.startswith(("HTTP 429", "HTTP 502", "HTTP 503", "HTTP 504", "Timeout")):
+            return True
+        if error.startswith("Connection error"):
+            # Retry generic transport issues, but not DNS lookup failures.
+            return not ("Failed to resolve" in error or "NameResolutionError" in error or "getaddrinfo failed" in error)
+        if error.startswith("DNS error"):
+            return False
+        return False
+
     # ------------------------------------------------------------------ high-level
     def chat(self, agent: str, prompt: str, max_tokens: int = 1500,
              temperature: float = 0.3, system: Optional[str] = None,
@@ -194,7 +246,7 @@ class VIOClient:
         messages.append({"role": "user", "content": prompt})
         res = self._post(agent, messages, max_tokens, temperature, timeout)
         for attempt in range(retries):
-            if res["ok"] or not res["error"].startswith(VIOGenerationAdapter.TRANSIENT_ERRORS):
+            if res["ok"] or not self._is_retryable_error(res.get("error", "")):
                 break
             time.sleep(4.0 * (2 ** attempt) * random.uniform(0.75, 1.25))
             res = self._post(agent, messages, max_tokens, temperature, timeout)
@@ -270,7 +322,7 @@ class VIOGenerationAdapter:
 
     def _pause(self, attempt: int, error: str) -> None:
         # Jitter keeps parallel components from retrying a struggling gateway in lockstep.
-        if error.startswith(self.TRANSIENT_ERRORS):
+        if self.client._is_retryable_error(error):
             time.sleep(self.backoff * (2 ** attempt) * random.uniform(0.75, 1.25))
 
     def generate(self, model: str, prompt: str, format: str = "", options: Optional[dict] = None, **_):
@@ -294,6 +346,8 @@ class VIOGenerationAdapter:
                 )
                 return res["content"], metrics
             error = res["error"] or "empty response"
+            if not self.client._is_retryable_error(error):
+                break
             if attempt + 1 < self.attempts:
                 self._pause(attempt, error)
         raise RuntimeError(f"VIO agent {self.agent} failed: {error}")

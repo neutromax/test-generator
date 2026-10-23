@@ -16,6 +16,7 @@ import io
 import json
 import os
 import re
+import ast
 import json
 import subprocess
 import sys
@@ -34,13 +35,13 @@ import streamlit as st
 import pandas as pd
 
 # Import the copilot_bridge module for automation functions
-from src import copilot_bridge
-from src import chat_assistant
-from src import coverage_view
-from src import results_view
-from src import run_history
-from src import run_progress
-from src import side_by_side
+from src import workflow_utils as copilot_bridge
+from src import workflow_utils as chat_assistant
+from src import workflow_utils as coverage_view
+from src import workflow_utils as results_view
+from src import workflow_utils as run_history
+from src import workflow_utils as run_progress
+from src import workflow_utils as side_by_side
 
 from src.generate_test_prompt import (
     TOOL_DIR,
@@ -100,7 +101,7 @@ logger = logging.getLogger(__name__)
 
 
 REPOSITORIES_DIR = TOOL_DIR / "repositories"
-VIEW_CHAT, VIEW_RESULTS, VIEW_ADVANCED = "💬 Chat", "📊 Results", "⚙️ Advanced"
+VIEW_CHAT, VIEW_RESULTS = "💬 Chat", "📊 Results"
 
 
 def validate_repository_url(repository_url: str) -> tuple[bool, str]:
@@ -775,19 +776,42 @@ def build_symbol_index(source_context: str) -> str:
     return "\n".join(parts)
 
 
-def create_task_prompt(task_type: str, repo_path: str) -> str:
-    """Create an Ollama prompt for a specific task type, grounded in real code.
+def create_task_prompt(task_type: str, repo_path: str, use_local_templates: bool = True) -> str:
+    """Create a task prompt grounded in repository code.
 
     ENHANCED v2 (100% Coverage Mode):
-    1. Reads enhanced prompt from /src/prompts/{task_type}_test.md (v2 with comprehensive coverage requirements)
+    1. Optionally reads enhanced prompt from /src/prompts/{task_type}_test.md
     2. Appends the actual repository source code (ground truth)
     3. Adds explicit list of importable symbols
     4. Falls back to dynamic prompt if file doesn't exist
+
+    Args:
+        task_type: test category
+        repo_path: repository root path
+        use_local_templates: True for Ollama flow, False for VIO flow
     """
     repo_path_obj = Path(repo_path)
     source_context, package = gather_source_context(str(repo_path_obj))
 
-    # STEP 1: Try to read enhanced prompt from /src/prompts/
+    if not use_local_templates:
+        # VIO agents already have cloud-side system prompts; send compact, grounded task context only.
+        if source_context:
+            symbol_index = build_symbol_index(source_context)
+            allowed_block = (
+                f"IMPORTABLE SYMBOLS:\n{symbol_index}\n\n" if symbol_index else ""
+            )
+            return (
+                f"TASK TYPE: {task_type}\n"
+                "Use your configured cloud agent instructions to generate tests from the repository source.\n\n"
+                f"{allowed_block}"
+                f"REPOSITORY SOURCE CODE (ground truth)\n```python\n{source_context}\n```\n"
+            )
+        return (
+            f"TASK TYPE: {task_type}\n"
+            "Use your configured cloud agent instructions and generate tests for this repository."
+        )
+
+    # STEP 1 (Ollama): Try to read enhanced prompt from /src/prompts/
     # Map task_type to prompt filename
     prompt_file_map = {
         "unit_test": "unit_test.md",
@@ -799,7 +823,7 @@ def create_task_prompt(task_type: str, repo_path: str) -> str:
     }
     
     prompt_filename = prompt_file_map.get(task_type, f"{task_type}_test.md")
-    enhanced_prompt_path = Path(__file__).parent / "prompts" / prompt_filename
+    enhanced_prompt_path = Path(__file__).parent / "src" / "prompts" / prompt_filename
     
     if enhanced_prompt_path.exists():
         try:
@@ -824,7 +848,7 @@ def create_task_prompt(task_type: str, repo_path: str) -> str:
             # Fall through to dynamic prompt generation below
 
     # FALLBACK: Dynamic prompt generation (old behavior)
-    logger.info(f"ℹ️ Enhanced prompt not found, using dynamic prompt generation for {task_type}")
+    logger.info(f"ℹ️ Ollama template prompt not found, using dynamic prompt generation for {task_type}")
     
     # High-level guidance from the repo's Test_Prompt.md (if present)
     guidance = ""
@@ -1355,8 +1379,26 @@ def run_pytest_single(repo_path: str, test_filename: str) -> dict:
     """Run pytest on a single generated test file and return pass/fail counts."""
     scripts_dir = Path(repo_path).resolve() / "tests" / "test_scripts"
     write_test_support(repo_path)
+    venv_python, venv_ok = get_venv_python(repo_path)
+    python_cmd = venv_python if venv_ok and venv_python else sys.executable
+    install_info = _install_script_requirements(repo_path, scripts_dir / test_filename, python_cmd)
+    if not install_info.get("success"):
+        out = (
+            "Failed to install generated test requirements before pytest.\n"
+            f"Script: {test_filename}\n"
+            f"Requirements: {', '.join(install_info.get('requirements') or [])}\n\n"
+            f"{install_info.get('output', '')}"
+        )
+        return {
+            "output": out,
+            "passed": 0,
+            "failed": 0,
+            "errors": 1,
+            "skipped": 0,
+            "all_passed": False,
+        }
     cmd = [
-        sys.executable, "-m", "pytest", str(scripts_dir / test_filename),
+        python_cmd, "-m", "pytest", str(scripts_dir / test_filename),
         "-c", str(scripts_dir / "pytest.ini"), "--rootdir", str(scripts_dir),
         f"--confcutdir={scripts_dir}", "-p", "no:cacheprovider", "--tb=short", "-v",
     ]
@@ -1495,6 +1537,75 @@ def parse_pytest_output(output: str) -> list[dict]:
 
 
 
+
+
+def _is_local_module(repo: Path, module: str) -> bool:
+    """True when module looks like part of the cloned repository source tree."""
+    return any([
+        (repo / f"{module}.py").exists(),
+        (repo / module / "__init__.py").exists(),
+        (repo / "src" / f"{module}.py").exists(),
+        (repo / "src" / module / "__init__.py").exists(),
+    ])
+
+
+def _stdlib_names() -> set[str]:
+    names = getattr(sys, "stdlib_module_names", None)
+    return set(names) if names else set()
+
+
+def _extract_script_requirements(script_path: Path, repo_path: str) -> list[str]:
+    """Infer third-party requirements from imports in a generated test script."""
+    try:
+        tree = ast.parse(script_path.read_text(encoding="utf-8"), filename=str(script_path))
+    except Exception:
+        return []
+
+    stdlib = _stdlib_names()
+    repo = Path(repo_path)
+    modules: set[str] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                modules.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            modules.add(node.module.split(".")[0])
+
+    skip = {"pytest", "conftest"}
+    requirements = [
+        module for module in sorted(modules)
+        if module and module not in stdlib and module not in skip and not _is_local_module(repo, module)
+    ]
+    return requirements
+
+
+def _install_script_requirements(repo_path: str, script_path: Path, venv_python: str) -> dict:
+    """Install inferred script dependencies into repo .venv and persist requirement lists."""
+    requirements = _extract_script_requirements(script_path, repo_path)
+    scripts_dir = script_path.parent
+
+    req_file = scripts_dir / f"{script_path.stem}_requirements.txt"
+    req_file.write_text("\n".join(requirements) + ("\n" if requirements else ""), encoding="utf-8")
+
+    aggregate = scripts_dir / "generated_requirements.txt"
+    previous = []
+    if aggregate.exists():
+        previous = [line.strip() for line in aggregate.read_text(encoding="utf-8").splitlines() if line.strip()]
+    merged = sorted(set(previous) | set(requirements))
+    aggregate.write_text("\n".join(merged) + ("\n" if merged else ""), encoding="utf-8")
+
+    if not requirements:
+        return {"success": True, "requirements": [], "output": ""}
+
+    cmd = [venv_python, "-m", "pip", "install", "-q", *requirements]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except Exception as exc:
+        return {"success": False, "requirements": requirements, "output": str(exc)}
+
+    output = (proc.stdout or "") + (proc.stderr or "")
+    return {"success": proc.returncode == 0, "requirements": requirements, "output": output}
 
 
 def get_venv_python(repo_path: str) -> tuple[str, bool]:
@@ -1695,6 +1806,9 @@ def generate_repository_prompt(repository_url: str) -> None:
             st.session_state["repository_url"] = repository_url
             st.session_state["clone_status"] = "Cloned successfully" if was_cloned else "Already cloned"
 
+            st.write("Creating isolated .venv and installing repository dependencies")
+            st.session_state["dep_install_result"] = install_repo_dependencies(str(repository_path))
+
             st.write("Generating Test_Prompt.md")
             prompt = build_prompt(repository_url, repository_path)
             prompt_path = repository_path / "Test_Prompt.md"
@@ -1738,6 +1852,10 @@ def clone_repository_only(repository_url: str) -> None:
             st.session_state["repository_path"] = str(repository_path)
             st.session_state["repository_url"] = repository_url
             st.session_state["clone_status"] = "Cloned successfully" if was_cloned else "Already cloned"
+
+            st.write("Creating isolated .venv and installing repository dependencies")
+            st.session_state["dep_install_result"] = install_repo_dependencies(str(repository_path))
+
             status.update(label="Repository ready", state="complete", expanded=False)
     except ValueError as error:
         st.error(f"Repository validation failed: {error}", icon="⚠️")
@@ -1780,22 +1898,19 @@ def run_tests_and_coverage(repo_path: str) -> dict:
     
     # Ensure coverage directory exists
     coverage_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Step 1: Check and install pytest/pytest-cov if needed
-    try:
-        import pytest
-    except ImportError:
-        try:
-            with st.spinner("Installing pytest and pytest-cov..."):
-                subprocess.run(
-                    ["pip", "install", "pytest", "pytest-cov", "-q"],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-        except subprocess.CalledProcessError as e:
-            result["error"] = f"Failed to install pytest: {e.stderr}"
-            return result
+
+    # Always execute tests from the cloned repo's isolated virtual environment.
+    venv_python, venv_ok = get_venv_python(repo_path)
+    if not venv_ok or not venv_python:
+        result["error"] = "Failed to create repository virtual environment (.venv)."
+        return result
+
+    dep_result = install_repo_dependencies(repo_path)
+    st.session_state["dep_install_result"] = dep_result
+    if not dep_result.get("success"):
+        result["error"] = dep_result.get("message", "Repository dependency install failed.")
+        result["output"] = dep_result.get("output", "")
+        return result
     
     # Step 2: Run pytest with coverage
     try:
@@ -1808,10 +1923,20 @@ def run_tests_and_coverage(repo_path: str) -> dict:
         if not test_files:
             result["error"] = "No test files found in tests/test_scripts/ (expected *_test.py files)"
             return result
+
+        for script in test_files:
+            install_info = _install_script_requirements(repo_path, script, venv_python)
+            if not install_info.get("success"):
+                result["error"] = (
+                    "Failed to install generated test requirements before pytest. "
+                    f"Script: {script.name}; requirements: {', '.join(install_info.get('requirements') or [])}"
+                )
+                result["output"] = install_info.get("output", "")
+                return result
         
         # Run pytest command
         pytest_cmd = [
-            "python",
+            venv_python,
             "-m",
             "pytest",
             str(test_scripts_dir),
@@ -3225,7 +3350,7 @@ def _build_aligned_bundle(repo_path: str) -> bytes:
 
     try:
         _report("generating")
-        prompt = create_task_prompt(task_type, repo_path)
+        prompt = create_task_prompt(task_type, repo_path, use_local_templates=False)
         result["prompt"] = prompt
         prompt_path = Path(repo_path) / "tests" / "orchestration_results" / f"{task_id}_prompt.md"
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3471,7 +3596,12 @@ def _vio_background_run(
         (Path(repo_path) / "tests" / "test_scripts").mkdir(parents=True, exist_ok=True)
         _write_vio_conftest(repo_path)
 
-        queue = select_components(repo_path, discover_components(repo_path), resume=resume)
+        queue = select_components(
+            repo_path,
+            discover_components(repo_path),
+            resume=resume,
+            required_types=selected_types,
+        )
         run_state["excluded"] = queue["excluded"]
         pending = queue["pending"]
         if target:
@@ -3504,15 +3634,8 @@ def _vio_background_run(
         planner = VIOGenerationAdapter(client, master)
         choose_writer = _vio_choose_writer(client, selected_types)
 
-        def work(component):
-            identity = component["module"] + "." + component["symbol"]
-            if run_progress.checkpoint(run_state):
-                run_state["not_started"] = run_state.get("not_started", 0) + 1
-                return
-            with lock:
-                run_state["current"] = run_state["current"] + [identity]
-        # Auto-install repository dependencies before test generation
-        # This ensures generated tests can import the target package
+        # Auto-install repository dependencies before test generation.
+        # This ensures generated tests can import the target package.
         logger.info("Installing repository dependencies for test execution...")
         try:
             dep_result = install_repo_dependencies(repo_path)
@@ -3525,8 +3648,13 @@ def _vio_background_run(
         except Exception as exc:
             logger.warning(f"Dependency installation failed (tests may still run): {exc}")
 
-        def work(task_type):
-            agent = TYPE_TO_AGENT.get(task_type, AGENTS["unit"])
+        def work(component):
+            identity = component["module"] + "." + component["symbol"]
+            if run_progress.checkpoint(run_state):
+                run_state["not_started"] = run_state.get("not_started", 0) + 1
+                return
+            with lock:
+                run_state["current"] = run_state["current"] + [identity]
             try:
                 result = process_component(
                     repo_path, component, selected_types, planner, master,
@@ -3568,8 +3696,6 @@ def _vio_background_run(
 
         _vio_finalize(client, repo_path, selected_types, models_state, run_state,
                       per_agent, plan_failures, len(components) + carried)
-            for task_type in selected_types:
-                work(task_type)
 
         summary_lines = [
             f"- {agent} ({result.get('task_type', '')}): "
@@ -4012,21 +4138,39 @@ def _legacy_run_vio_orchestration(selected_types: list, parallel: bool = True, g
 
 
 def run_vio_orchestration(selected_types: list, parallel: bool = True, max_components: int = 0,
-                          mode: str = VIO_MODE_RECOMMENDED, target: str = "") -> None:
-    """Initialize shared per-agent state and launch VIO work in a background thread."""
+                          mode: str = VIO_MODE_RECOMMENDED, target: str = "") -> str:
+    """Initialize shared per-agent state and launch VIO work in a background thread.
+
+    Returns an error message when startup is blocked; empty string on success.
+    """
     client = st.session_state.get("vio_client")
     repo_path = st.session_state.get("repository_path")
     if not client:
-        st.error("Connect to VIO first.")
-        return
+        msg = "Connect to VIO first."
+        st.error(msg)
+        return msg
     if not repo_path:
-        st.error("Clone a repository first (enter a URL and generate).")
-        return
+        msg = "Clone a repository first (enter a URL and generate)."
+        st.error(msg)
+        return msg
+
+    # Fast-fail on deterministic DNS issues to avoid retry storms in background workers.
+    try:
+        health = client.ping_detail() if hasattr(client, "ping_detail") else {"ok": client.ping(), "error": ""}
+    except Exception as exc:
+        health = {"ok": False, "error": str(exc)}
+    if not health.get("ok"):
+        err = str(health.get("error", ""))
+        if "DNS error" in err or "Failed to resolve" in err or "NameResolutionError" in err or "getaddrinfo failed" in err:
+            msg = "VIO host is not resolvable from this machine right now. Use Ollama, or fix DNS/VPN and retry."
+            st.error(msg)
+            return msg
 
     current_run = st.session_state.get("vio_run_state") or {}
     if current_run.get("active"):
-        st.warning("VIO generation is already running.")
-        return
+        msg = "VIO generation is already running."
+        st.warning(msg)
+        return msg
 
     models_state = {
         TYPE_TO_AGENT.get(task_type, AGENTS["unit"]): {
@@ -4055,21 +4199,38 @@ def run_vio_orchestration(selected_types: list, parallel: bool = True, max_compo
         daemon=True,
     )
     worker.start()
+    return ""
 
 
-def run_vio_rerun_failed(repo_path: str, parallel: bool = True) -> None:
-    """Launch the background job that retries only the failed specs of the last VIO run."""
+def run_vio_rerun_failed(repo_path: str, parallel: bool = True) -> str:
+    """Launch the background job that retries only the failed specs of the last VIO run.
+
+    Returns an error message when startup is blocked; empty string on success.
+    """
     client = st.session_state.get("vio_client")
     if not client:
-        st.error("Connect to VIO first.")
-        return
+        msg = "Connect to VIO first."
+        st.error(msg)
+        return msg
+    try:
+        health = client.ping_detail() if hasattr(client, "ping_detail") else {"ok": client.ping(), "error": ""}
+    except Exception as exc:
+        health = {"ok": False, "error": str(exc)}
+    if not health.get("ok"):
+        err = str(health.get("error", ""))
+        if "DNS error" in err or "Failed to resolve" in err or "NameResolutionError" in err or "getaddrinfo failed" in err:
+            msg = "VIO host is not resolvable from this machine right now. Use Ollama, or fix DNS/VPN and retry."
+            st.error(msg)
+            return msg
     if (st.session_state.get("vio_run_state") or {}).get("active"):
-        st.warning("VIO generation is already running.")
-        return
+        msg = "VIO generation is already running."
+        st.warning(msg)
+        return msg
     state = _vio_load_state(repo_path)
     if not state:
-        st.warning("No earlier VIO run was found for this repository.")
-        return
+        msg = "No earlier VIO run was found for this repository."
+        st.warning(msg)
+        return msg
 
     models_state = {
         TYPE_TO_AGENT.get(task_type, AGENTS["unit"]): {"status": "queued", "task_type": task_type, "tokens": 0}
@@ -4085,6 +4246,7 @@ def run_vio_rerun_failed(repo_path: str, parallel: bool = True) -> None:
         name="vio-test-rerun",
         daemon=True,
     ).start()
+    return ""
 
 
 def _vio_topup_background(client, repo_path, identity, row, models_state, run_state) -> None:
@@ -4128,6 +4290,14 @@ def run_vio_topup(repo_path: str, row: dict) -> str:
     client = _chat_vio_client()
     if client is None:
         return "I can't reach VIO. Check VIO_API_KEY in your .env."
+    try:
+        health = client.ping_detail() if hasattr(client, "ping_detail") else {"ok": client.ping(), "error": ""}
+    except Exception as exc:
+        health = {"ok": False, "error": str(exc)}
+    if not health.get("ok"):
+        err = str(health.get("error", ""))
+        if "DNS error" in err or "Failed to resolve" in err or "NameResolutionError" in err or "getaddrinfo failed" in err:
+            return "VIO host is not resolvable from this machine right now. Use Ollama, or fix DNS/VPN and retry."
     state = _vio_load_state(repo_path)
     if not state:
         return "No earlier VIO run was found for this repository."
@@ -4260,8 +4430,12 @@ def render_vio_workspace() -> None:
         with st.spinner("Scanning components..."):
             st.session_state["vio_queue_preview"] = {
                 "path": str(preview_path),
-                "queue": select_components(preview_path, discover_components(preview_path),
-                                           resume=mode != VIO_MODE_RECOMMENDED),
+                "queue": select_components(
+                    preview_path,
+                    discover_components(preview_path),
+                    resume=mode != VIO_MODE_RECOMMENDED,
+                    required_types=selected_types,
+                ),
             }
     preview = st.session_state.get("vio_queue_preview")
     if preview and preview["path"] == str(preview_path):
@@ -4308,7 +4482,9 @@ def render_vio_workspace() -> None:
             dep_result.get("message", ""))
 
     if rerun and known_path:
-        run_vio_rerun_failed(known_path, parallel=parallel)
+        error = run_vio_rerun_failed(known_path, parallel=parallel)
+        if error:
+            st.warning(error)
 
     if run:
         if not selected_types:
@@ -4318,15 +4494,17 @@ def render_vio_workspace() -> None:
         else:
             generate_repository_prompt(repo_url)  # clone + set repository_path
             if st.session_state.get("repository_path"):
-                run_vio_orchestration(selected_types, parallel=parallel,
-                                      max_components=0 if mode == VIO_MODE_ALL else int(max_components), mode=mode)
+                error = run_vio_orchestration(
+                    selected_types,
+                    parallel=parallel,
+                    max_components=0 if mode == VIO_MODE_ALL else int(max_components),
+                    mode=mode,
+                )
+                if error:
+                    st.warning(error)
 
 
-CHAT_GREETING = (
-    "**Hi there! How can I help you?**\n\n"
-    "Share the GitHub repository link and the type of tests you need: unit, integration, e2e or security. "
-    "For example: `https://github.com/owner/repository` with unit tests."
-)
+CHAT_GREETING = ""
 CHAT_CUSTOM = chat_assistant.CUSTOM_MODE
 CHAT_SPEC_LABELS = {
     VIO_MODE_ALL: "Run all components",
@@ -4349,17 +4527,33 @@ def _chat_repo_names() -> list:
     return sorted(p.name for p in REPOSITORIES_DIR.iterdir() if p.is_dir() and not p.name.startswith("."))
 
 
-def _chat_vio_client():
-    """Connected VIO client, connecting on demand; None when unconfigured or unreachable."""
-    if st.session_state.get("vio_client") and st.session_state.get("vio_connected"):
-        return st.session_state["vio_client"]
+def _chat_vio_client(require_live: bool = False):
+    """VIO client for chat; resilient to transient ping failures.
+
+    - Returns None only when VIO is unconfigured.
+    - With require_live=True, returns None when ping fails.
+    - With require_live=False (default), returns a configured client even if ping fails,
+      so execution can still attempt API calls with retry logic.
+    """
+    existing = st.session_state.get("vio_client")
+    if existing and getattr(existing, "is_configured", False):
+        if not require_live:
+            return existing
+        ok = existing.ping()
+        st.session_state["vio_connected"] = ok
+        return existing if ok else None
+
     client = VIOClient(base_url=st.session_state.get("vio_endpoint", ""))
     if not client.is_configured:
+        st.session_state["vio_connected"] = False
         return None
+
     ok = client.ping()
     st.session_state["vio_client"] = client
     st.session_state["vio_connected"] = ok
-    return client if ok else None
+    if require_live and not ok:
+        return None
+    return client
 
 
 def _chat_prepare_repo(request: dict) -> tuple:
@@ -4419,8 +4613,10 @@ def _chat_status() -> str:
 
 
 def _chat_rerun(request: dict) -> str:
-    if _chat_vio_client() is None:
-        return "I can't reach VIO, so I can't re-run specs. Check VIO_API_KEY in your .env."
+    if _chat_vio_client(require_live=True) is None:
+        if not os.getenv("VIO_API_KEY"):
+            return "VIO is not configured. Add VIO_API_KEY in your .env, then try again."
+        return "I can't reach VIO right now, so I can't re-run specs. Please try again in a moment."
     path = ""
     if request["repo_url"] or request["repo_name"]:
         path, error = _chat_prepare_repo(request)
@@ -4432,7 +4628,10 @@ def _chat_rerun(request: dict) -> str:
         return "There are no failed specs to re-run."
     if (st.session_state.get("vio_run_state") or {}).get("active"):
         return "A run is already in progress; I'll report when it finishes."
-    run_vio_rerun_failed(path, parallel=True)
+    start_error = run_vio_rerun_failed(path, parallel=True)
+    if start_error:
+        st.session_state.update(chat_run_pending=False)
+        return start_error
     st.session_state.update(chat_run_pending=True, chat_stage="running")
     return f"Re-running {count} failed specs. Progress is below."
 
@@ -4471,7 +4670,9 @@ def _chat_start(request: dict) -> str:
         if _chat_vio_client() is None:
             request["engine"] = ""
             state["chat_stage"] = "engine"
-            return "I can't reach VIO. Check VIO_API_KEY in your .env, or choose Ollama."
+            if not os.getenv("VIO_API_KEY"):
+                return "VIO is not configured. Add VIO_API_KEY in your .env, or choose Ollama."
+            return "VIO is currently unavailable. Please try again, or choose Ollama."
 
     target, choice = request["target"], request["mode"]
     mode = VIO_MODE_CONTINUE if choice == CHAT_CUSTOM else choice
@@ -4486,7 +4687,12 @@ def _chat_start(request: dict) -> str:
             return (f"I couldn't find a class or function matching `{target}` in {Path(path).name}. "
                     "Choose how to select components, or name another one.")
         components, mode = matching, VIO_MODE_CONTINUE
-    pending = select_components(path, components, resume=mode != VIO_MODE_RECOMMENDED)["pending"]
+    pending = select_components(
+        path,
+        components,
+        resume=mode != VIO_MODE_RECOMMENDED,
+        required_types=request.get("test_types") or [],
+    )["pending"]
     if not pending:
         request.update(target="", max_components=0, mode="", confirmed=False)
         state["chat_stage"] = "done"
@@ -4494,8 +4700,9 @@ def _chat_start(request: dict) -> str:
 
     if choice == VIO_MODE_ALL and not request.get("confirmed"):
         state["chat_stage"] = "confirm"
-        return (f"Run all will specify {len(pending)} components in `{Path(path).name}`. Each one needs several "
-                "model requests, so this can take a long time. Start?")
+        default = (f"Run all will specify {len(pending)} components in `{Path(path).name}`. Each one needs several "
+                   "model requests, so this can take a long time. Start?")
+        return _chat_master_question("confirm_run_all", default, request)
 
     limit = 0 if target or mode == VIO_MODE_ALL else (request["max_components"] or 20)
     types = request["test_types"]
@@ -4505,7 +4712,13 @@ def _chat_start(request: dict) -> str:
     if request["engine"] == "ollama":
         return _chat_run_ollama(path, types, mode, pending, limit)
 
-    run_vio_orchestration(types, parallel=True, max_components=limit, mode=mode, target=target)
+    start_error = run_vio_orchestration(types, parallel=True, max_components=limit, mode=mode, target=target)
+    if start_error:
+        state.update(chat_run_pending=False)
+        state["chat_stage"] = "engine"
+        if request["engine"] == "vio":
+            request["engine"] = ""
+        return start_error
     state.update(chat_run_pending=True, chat_stage="running")
     reply = chat_assistant.describe_request({**request, "test_types": types, "target": target}, label)
     reply = reply.replace("Generating", "Generating with VIO", 1)
@@ -4523,7 +4736,12 @@ def _chat_queue_text(request: dict) -> str:
         request.update(repo_url="", repo_name="")
         st.session_state["chat_stage"] = "intake"
         return error + " Please share the GitHub repository link again."
-    queue = select_components(path, discover_components(path), resume=True)
+    queue = select_components(
+        path,
+        discover_components(path),
+        resume=True,
+        required_types=request.get("test_types") or [],
+    )
     return (f"`{Path(path).name}` has {queue['meaningful']} meaningful components: {len(queue['pending'])} still "
             f"need a spec, {queue['already_specified']} already have one, and {len(queue['excluded'])} are "
             "skipped as trivial or internal.")
@@ -4535,13 +4753,16 @@ def _chat_advance() -> str:
     request = state["chat_request"]
     if not (request["repo_url"] or request["repo_name"]):
         state["chat_stage"] = "intake"
-        return chat_assistant.missing_question(request, _chat_repo_names())
+        default = chat_assistant.missing_question(request, _chat_repo_names())
+        return _chat_master_question("ask_repository", default, request)
     if not request["test_types"]:
         state["chat_stage"] = "intake"
-        return "Which test types do you need (one or more): unit, integration, e2e or security?"
+        default = "Which test types do you need (one or more): unit, integration, e2e or security?"
+        return _chat_master_question("ask_test_types", default, request)
     if not request["engine"]:
         state["chat_stage"] = "engine"
-        return "How would you like to generate the tests?"
+        default = "How would you like to generate the tests?"
+        return _chat_master_question("ask_engine", default, request)
     if not request["mode"]:
         counts = _chat_queue_text(request)
         if not (request["repo_url"] or request["repo_name"]):
@@ -4551,10 +4772,12 @@ def _chat_advance() -> str:
         summary = f"Test types: {chat_assistant.type_label(types)}."
         if len(types) > 1:
             summary += " They are combined in one spec and one script per component."
-        return f"{summary} {counts}\n\n{CHAT_SPEC_PROMPT}"
+        default = f"{summary} {counts}\n\n{CHAT_SPEC_PROMPT}"
+        return _chat_master_question("ask_scope_mode", default, request)
     if request["mode"] == CHAT_CUSTOM and not (request["target"] or request["max_components"]):
         state["chat_stage"] = "custom"
-        return "Type the class or function to cover, or how many components (for example `Parser` or `10`)."
+        default = "Type the class or function to cover, or how many components (for example `Parser` or `10`)."
+        return _chat_master_question("ask_custom_target_or_count", default, request)
     return _chat_start(request)
 
 
@@ -4567,19 +4790,162 @@ def _chat_new_repository() -> str:
     engine = st.session_state["chat_request"]["engine"]
     st.session_state["chat_request"] = {**chat_assistant.new_request(), "engine": engine}
     st.session_state["chat_stage"] = "intake"
-    return "Sure. Share the GitHub repository link and the type of tests you need."
+    default = "Sure. Share the GitHub repository link and the type of tests you need."
+    return _chat_master_question("ask_new_repository", default, st.session_state["chat_request"])
+
+
+def _chat_master_fallback(user_text: str) -> str | None:
+    """Route free-form chat commands to VIO master when available."""
+    client = _chat_vio_client()
+    if client is None:
+        return None
+
+    state = st.session_state
+
+    request = state.get("chat_request", {})
+    run_state = state.get("vio_run_state", {})
+    context = (
+        f"Repository URL: {request.get('repo_url') or '-'}\n"
+        f"Repository name: {request.get('repo_name') or '-'}\n"
+        f"Requested test types: {', '.join(request.get('test_types') or []) or '-'}\n"
+        f"Engine: {request.get('engine') or '-'}\n"
+        f"Mode: {request.get('mode') or '-'}\n"
+        f"Run stage: {_chat_stage_label(run_state) if run_state else 'Idle'}\n"
+    )
+    prompt = (
+        "You are TestGenie master assistant. The user may ask commands beyond preset prompts. "
+        "Answer clearly and briefly using the context below. If the user asks to run/trigger actions, "
+        "reply with the exact next step they should type in this chat.\n\n"
+        f"CURRENT CONTEXT:\n{context}\n"
+        f"USER MESSAGE:\n{user_text}\n"
+    )
+    try:
+        result = client.chat(AGENTS["master"], prompt, max_tokens=450, temperature=0.2, timeout=90, retries=2)
+    except Exception:
+        logger.exception("Master chat fallback failed")
+        return None
+    if result.get("ok") and result.get("content"):
+        return str(result["content"]).strip()
+    return None
+
+
+def _chat_master_question(goal: str, default: str, request: dict | None = None) -> str:
+    """Have master phrase stage questions simply; fallback to default text."""
+    client = _chat_vio_client()
+    if client is None:
+        return default
+    payload = {
+        "goal": goal,
+        "request": request or st.session_state.get("chat_request", {}),
+    }
+    prompt = (
+        "You are TestGenie assistant. Rephrase the question below in very simple plain English. "
+        "Keep it short (1-2 lines), friendly, actionable, and text-only (no markdown list).\n"
+        f"CONTEXT: {json.dumps(payload)}\n"
+        f"DEFAULT QUESTION: {default}"
+    )
+    try:
+        res = client.chat(AGENTS["master"], prompt, max_tokens=120, temperature=0.2, timeout=60, retries=1)
+    except Exception:
+        logger.exception("Master question phrasing failed")
+        return default
+    text = str(res.get("content") or "").strip() if res.get("ok") else ""
+    return text or default
+
+
+def _chat_master_interpret(user_text: str) -> dict | None:
+    """Primary chat interpreter: ask master to return structured routing JSON."""
+    client = _chat_vio_client()
+    if client is None:
+        return None
+
+    state = st.session_state
+
+    request = state.get("chat_request", {})
+    run_state = state.get("vio_run_state", {})
+    context = {
+        "repo_url": request.get("repo_url", ""),
+        "repo_name": request.get("repo_name", ""),
+        "test_types": request.get("test_types", []),
+        "engine": request.get("engine", ""),
+        "mode": request.get("mode", ""),
+        "run_stage": _chat_stage_label(run_state) if run_state else "Idle",
+    }
+    prompt = (
+        "Return STRICT JSON only (no markdown) using this schema: "
+        '{"intent":"generate|rerun|status|count|other","repo_url":"","repo_name":"",'
+        '"test_types":[],"target":"","max_components":0,"mode":"","engine":"","reply":""}.\n'
+        "Rules: infer intent and fields from the user message; use empty values when unknown; "
+        "test_types can contain only unit_test,integration_test,e2e_test,security,vulnerability; "
+        "engine can be vio or ollama; mode can be recommended,continue,all,custom. "
+        "For intent=other, fill reply with a concise plain-text response.\n"
+        f"CONTEXT: {json.dumps(context)}\n"
+        f"USER: {user_text}"
+    )
+    try:
+        result = client.chat(AGENTS["master"], prompt, max_tokens=350, temperature=0.0, timeout=90, retries=2)
+    except Exception:
+        logger.exception("Master interpret failed")
+        return None
+    if not (result.get("ok") and result.get("content")):
+        return None
+    try:
+        data = json.loads(result["content"])
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    parsed = {
+        "intent": str(data.get("intent") or "other").strip().lower(),
+        "repo_url": str(data.get("repo_url") or "").strip(),
+        "repo_name": str(data.get("repo_name") or "").strip(),
+        "test_types": [t for t in (data.get("test_types") or []) if t in
+                       {"unit_test", "integration_test", "e2e_test", "security", "vulnerability"}],
+        "target": str(data.get("target") or "").strip(),
+        "max_components": int(data.get("max_components") or 0),
+        "mode": str(data.get("mode") or "").strip().lower(),
+        "engine": str(data.get("engine") or "").strip().lower(),
+        "reply": str(data.get("reply") or "").strip(),
+    }
+    if parsed["intent"] not in {"generate", "rerun", "status", "count", "other"}:
+        parsed["intent"] = "other"
+    return parsed
 
 
 def _chat_reply(text: str) -> str:
     state = st.session_state
     request = state["chat_request"]
     names = _chat_repo_names()
-    client = state.get("vio_client") if state.get("vio_connected") else None
-    local = chat_assistant.interpret_locally(text, names)
-    understood = any(local.get(key) for key in ("repo_url", "repo_name", "test_types", "engine")) or local["intent"] != "other"
-    ask = (lambda prompt, system=None: client.chat(
-        AGENTS["unit"], prompt, system=system, max_tokens=400, temperature=0.0)) if client and not understood else None
-    parsed = chat_assistant.interpret(text, state["chat_messages"][:-1], names, request, ask)
+    stage = state.get("chat_stage")
+    word = text.strip().strip("`")
+
+    # Deterministic stage shortcuts so simple replies do not depend on master parsing.
+    if stage == "engine":
+        low = word.lower()
+        if low in {"vio", "ollama"}:
+            return _chat_set(engine=low)
+    if stage == "specs":
+        low = word.lower()
+        if word.isdigit():
+            return _chat_set(mode=CHAT_CUSTOM, max_components=int(word))
+        if low in {"all", "run all", "all components"}:
+            return _chat_set(mode=VIO_MODE_ALL)
+        if low in {"continue", "uncovered", "uncovered components", "next"}:
+            return _chat_set(mode=VIO_MODE_CONTINUE)
+        if low in {"fresh", "fresh start", "recommended", "default"}:
+            return _chat_set(mode=VIO_MODE_RECOMMENDED)
+        if low in {"custom", "customised", "customized"}:
+            return _chat_set(mode=CHAT_CUSTOM)
+
+    parsed = _chat_master_interpret(text)
+    if parsed is None:
+        # Backup parser path when master is unavailable.
+        client = state.get("vio_client") if state.get("vio_connected") else None
+        ask = (lambda prompt, system=None: client.chat(
+            AGENTS["master"], prompt, system=system, max_tokens=450, temperature=0.0, timeout=90, retries=2)
+        ) if client else None
+        parsed = chat_assistant.interpret(text, state["chat_messages"][:-1], names, request, ask)
 
     if state.get("chat_stage") == "custom" and not (parsed.get("target") or parsed.get("max_components")):
         word = text.strip().strip("`")
@@ -4593,9 +4959,9 @@ def _chat_reply(text: str) -> str:
     if (parsed.get("target") or parsed.get("max_components")) and not parsed.get("mode"):
         parsed["mode"] = CHAT_CUSTOM
 
-    has_fields = any(parsed.get(key) for key in (
-        "repo_url", "repo_name", "test_types", "target", "max_components", "mode", "engine"))
-    intent = "generate" if parsed["intent"] == "other" and has_fields else parsed["intent"]
+    # Master agent is the primary intent router. Do not auto-promote conversational
+    # replies to the old staged generate flow based only on extracted fields.
+    intent = parsed["intent"]
     if intent == "status":
         return _chat_status()
     if intent == "count":
@@ -4606,7 +4972,30 @@ def _chat_reply(text: str) -> str:
         with st.spinner("Counting components…"):
             return _chat_queue_text(request)
     if intent == "other":
-        return parsed.get("reply") or chat_assistant.HELP_TEXT
+        # If we're in a staged intake step, recover with the deterministic local parser
+        # so short answers like "vio" or "yes" still advance the flow.
+        if state.get("chat_stage") in {"intake", "engine", "specs", "custom", "confirm"}:
+            client = state.get("vio_client") if state.get("vio_connected") else None
+            ask = (lambda prompt, system=None: client.chat(
+                AGENTS["master"], prompt, system=system, max_tokens=450, temperature=0.0, timeout=90, retries=2)
+            ) if client else None
+            fallback = chat_assistant.interpret(text, state["chat_messages"][:-1], names, request, ask)
+            has_fields = any([
+                fallback.get("repo_url"),
+                fallback.get("repo_name"),
+                fallback.get("test_types"),
+                fallback.get("engine"),
+                fallback.get("mode"),
+                fallback.get("target"),
+                fallback.get("max_components"),
+            ])
+            if fallback.get("intent") != "other" or has_fields:
+                parsed = fallback
+                intent = parsed.get("intent", "generate")
+            else:
+                return parsed.get("reply") or _chat_master_fallback(text) or chat_assistant.HELP_TEXT
+        else:
+            return parsed.get("reply") or _chat_master_fallback(text) or chat_assistant.HELP_TEXT
 
     request = chat_assistant.merge_request(request, parsed)
     state["chat_request"] = request
@@ -4921,6 +5310,499 @@ def _render_side_by_side(models: dict) -> None:
             st.code(output, language="text")
 
 
+def _worker_agent_states(models: dict) -> list:
+    return [(agent, data) for agent, data in models.items() if agent != AGENTS["master"] and "passed" in data]
+
+
+def _agent_test_type(agent: str, item: dict, data: dict) -> str:
+    writer = str(item.get("writer") or agent)
+    if writer == AGENTS.get("unit"):
+        return "unit"
+    if writer == AGENTS.get("integration"):
+        return "integration"
+    if writer == AGENTS.get("e2e"):
+        return "e2e"
+    if writer == AGENTS.get("security"):
+        return "security"
+    task_type = str(data.get("task_type") or "").lower()
+    if "integration" in task_type:
+        return "integration"
+    if "e2e" in task_type:
+        return "e2e"
+    if "security" in task_type:
+        return "security"
+    return "unit"
+
+
+def _results_case_catalog(models: dict) -> list:
+    """Flatten planned scenarios into numbered test-case rows for UI + AI chat references."""
+    cases = []
+    counter = 1
+    for agent, data in _worker_agent_states(models):
+        for item in data.get("components", []):
+            case_type = _agent_test_type(agent, item, data)
+            for scenario in side_by_side.scenario_rows(item):
+                case_id = f"TC-{counter:04d}"
+                counter += 1
+                cases.append({
+                    "case_id": case_id,
+                    "component": item.get("component", ""),
+                    "test_type": case_type,
+                    "scenario_id": scenario.get("id", ""),
+                    "test_name": scenario.get("name", ""),
+                    "category": scenario.get("category", ""),
+                    "inputs": scenario.get("inputs", ""),
+                    "expected": scenario.get("expected", ""),
+                    "evidence": scenario.get("evidence", ""),
+                    "code": scenario.get("code", ""),
+                    "status": scenario.get("status", "NOT RUN"),
+                    "reason": scenario.get("reason", ""),
+                    "script": item.get("script", ""),
+                    "spec": item.get("spec", ""),
+                })
+    return cases
+
+
+def _refresh_worker_rollups(models: dict) -> None:
+    """Recompute worker totals after manual script reruns/edits."""
+    for _agent, data in _worker_agent_states(models):
+        passed = failed = errors = skipped = 0
+        runnable = fully_passing = needs_review = unresolved = 0
+        tests = []
+        for item in data.get("components", []):
+            execution = item.get("execution") or {}
+            item["tests"] = parse_pytest_output(execution.get("output", "")) if execution else []
+            tests.extend({**test, "component": item.get("component", "")} for test in item.get("tests", []))
+            if execution:
+                runnable += 1
+                passed += execution.get("passed", 0)
+                failed += execution.get("failed", 0)
+                errors += execution.get("errors", 0)
+                skipped += execution.get("skipped", 0)
+            if item.get("status") == "COMPLETED":
+                fully_passing += 1
+            if item.get("review_flags"):
+                needs_review += 1
+            if item.get("repair_unresolved"):
+                unresolved += 1
+        data.update(
+            results=tests,
+            passed=passed,
+            failed=failed,
+            errors=errors,
+            skipped=skipped,
+            runnable=runnable,
+            fully_passing=fully_passing,
+            needs_review=needs_review,
+            unresolved=unresolved,
+        )
+
+
+def _update_component_execution(models: dict, component: str, execution: dict) -> bool:
+    for _agent, data in _worker_agent_states(models):
+        for item in data.get("components", []):
+            if item.get("component") != component:
+                continue
+            item["execution"] = execution
+            item["tests"] = parse_pytest_output(execution.get("output", ""))
+            item["status"] = "COMPLETED" if execution.get("all_passed") else "FAILED"
+            item["error"] = "" if execution.get("all_passed") else \
+                "Tests did not all pass; inspect per-test results and environment requirements."
+            return True
+    return False
+
+
+def _replace_test_function(script_code: str, test_name: str, replacement_function: str) -> tuple[str, bool]:
+    """Replace one test function by name; returns (updated_code, replaced)."""
+    try:
+        tree = ast.parse(script_code)
+    except SyntaxError:
+        return script_code + "\n\n" + replacement_function.strip() + "\n", False
+    lines = script_code.splitlines()
+    target = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == test_name:
+            target = node
+            break
+    if target is None or getattr(target, "end_lineno", None) is None:
+        return script_code + "\n\n" + replacement_function.strip() + "\n", False
+    start = int(target.lineno) - 1
+    end = int(target.end_lineno)
+    merged = lines[:start] + replacement_function.strip().splitlines() + lines[end:]
+    return "\n".join(merged).rstrip() + "\n", True
+
+
+def _extract_target_function(candidate: str, desired_name: str) -> str:
+    """Pull one function body from model output; fallback to full candidate text."""
+    sources = side_by_side.function_sources(candidate)
+    if desired_name in sources:
+        return sources[desired_name]
+    for name, body in sources.items():
+        if name.startswith("test_"):
+            return body
+    return candidate
+
+
+def _case_from_prompt(user_text: str, case_index: dict, active_case_id: str) -> dict | None:
+    token = re.search(r"\bTC-\d{4}\b", user_text.upper())
+    if token:
+        return case_index.get(token.group(0))
+    if active_case_id:
+        return case_index.get(active_case_id)
+    return None
+
+
+def _target_test_name(user_text: str, default_name: str) -> str:
+    """Pick an explicit test function name from user text when present."""
+    hit = re.search(r"\b(test_[A-Za-z0-9_]+)\b", user_text)
+    if hit:
+        return hit.group(1)
+    qualified = re.search(r"\b([A-Za-z0-9_]+::test_[A-Za-z0-9_]+)\b", user_text)
+    if qualified:
+        return qualified.group(1).split("::")[-1]
+    return default_name
+
+
+def _results_ai_action_kind(user_text: str) -> str:
+    text = user_text.lower()
+    wants_fix = bool(re.search(r"\b(fix|change|rewrite|modify|update)\b", text))
+    wants_run = bool(re.search(r"\b(run|rerun|re-run|execute|retry)\b", text))
+    if wants_fix:
+        return "fix_rerun"
+    if wants_run:
+        return "rerun"
+    return ""
+
+
+def _is_affirmative(user_text: str) -> bool:
+    return bool(re.fullmatch(r"\s*(yes|y|ok|okay|sure|go|proceed|run|do it|continue)\s*[.!]?\s*", user_text.lower()))
+
+
+def _is_negative(user_text: str) -> bool:
+    return bool(re.fullmatch(r"\s*(no|n|cancel|stop|don'?t|do not)\s*[.!]?\s*", user_text.lower()))
+
+
+def _resolve_case_script_path(repo_path: str, script_ref: str) -> Path | None:
+    """Resolve saved script references that may be absolute paths or bare filenames."""
+    if not script_ref:
+        return None
+    candidate = Path(script_ref)
+    if candidate.is_file():
+        return candidate
+
+    repo = Path(repo_path)
+    scripts_dir = repo / "tests" / "test_scripts"
+
+    # Common case: stored as bare file name.
+    by_name = scripts_dir / candidate.name
+    if by_name.is_file():
+        return by_name
+
+    # Sometimes stored as path relative to repo root.
+    rel_repo = repo / script_ref
+    if rel_repo.is_file():
+        return rel_repo
+
+    # Last-resort: any generated script with same name anywhere under test_scripts.
+    matches = list(scripts_dir.rglob(candidate.name)) if scripts_dir.exists() else []
+    return matches[0] if matches else None
+
+
+def _results_ai_reply(user_text: str, case_index: dict, models: dict, repo_path: str, active_case_id: str = "") -> str:
+    case = _case_from_prompt(user_text, case_index, active_case_id)
+    wants_fix = bool(re.search(r"\b(fix|change|rewrite|modify|update)\b", user_text.lower()))
+    wants_rerun = bool(re.search(r"\b(run|rerun|re-run|execute|retry)\b", user_text.lower()))
+
+    if wants_fix and not case:
+        return "Pick a case in the table first, or mention a case number like TC-0003 so I know which test to edit."
+    if wants_fix and not case.get("script"):
+        return f"{case['case_id']} has no saved script path yet, so I can't edit it."
+
+    if wants_rerun and not wants_fix:
+        if not case:
+            return "Pick a case in the table first, or mention a case number like TC-0003 so I know what to run."
+        script_path = _resolve_case_script_path(repo_path, str(case.get("script") or ""))
+        if script_path is None:
+            return (
+                f"Script file not found for {case['case_id']}. This case likely failed before script generation "
+                "or the script was cleaned up. Re-run this component/spec first."
+            )
+        execution = run_pytest_single(repo_path, script_path.name)
+        _update_component_execution(models, case["component"], execution)
+        _refresh_worker_rollups(models)
+        verdict = "now passes" if execution.get("all_passed") else "still fails"
+        return (
+            f"Re-ran {case['case_id']} ({script_path.name}): {execution.get('passed', 0)} passed, "
+            f"{execution.get('failed', 0)} failed, {execution.get('errors', 0)} errors ({verdict})."
+        )
+
+    client = _chat_vio_client()
+    if wants_fix and client is None:
+        return "VIO master is unavailable right now, so I can't generate a patch automatically."
+
+    if wants_fix:
+        script_path = _resolve_case_script_path(repo_path, str(case.get("script") or ""))
+        if script_path is None:
+            return (
+                f"Script file not found for {case['case_id']}. This case likely failed before script generation "
+                "or the script was cleaned up. Re-run this component/spec first, then ask me to fix it."
+            )
+        target_name = _target_test_name(user_text, case["test_name"])
+        max_rounds = 3
+        latest_execution = None
+        replaced_any = False
+        round_notes = []
+        last_failure = case.get("reason") or ""
+
+        for round_no in range(1, max_rounds + 1):
+            current = script_path.read_text(encoding="utf-8")
+            prompt = (
+                "You are fixing one pytest function. Return ONLY one python function body for the target test, no fences.\n"
+                f"Case: {case['case_id']}\n"
+                f"Component: {case['component']}\n"
+                f"Test type: {case['test_type']}\n"
+                f"Scenario: {case['scenario_id']} {case['category']}\n"
+                f"Inputs: {case['inputs']}\n"
+                f"Expected: {case['expected']}\n"
+                f"Failure: {last_failure}\n"
+                f"Target test function name: {target_name}\n\n"
+                f"Current test function code:\n{case['code'] or '# missing function source'}\n\n"
+                f"Full script for context:\n{current[:9000]}\n\n"
+                f"User request:\n{user_text}\n"
+            )
+            response = client.chat(
+                AGENTS["master"], prompt, max_tokens=1400, temperature=0.1, timeout=120, retries=1)
+            if not response.get("ok") or not response.get("content"):
+                round_notes.append(f"round {round_no}: no patch returned")
+                break
+
+            candidate = extract_python_code(response["content"]).strip() or str(response["content"]).strip()
+            replacement = _extract_target_function(candidate, target_name)
+            if "def " not in replacement:
+                round_notes.append(f"round {round_no}: invalid function patch")
+                break
+
+            updated, replaced = _replace_test_function(current, target_name, replacement)
+            if updated == current:
+                round_notes.append(f"round {round_no}: patch made no change")
+                break
+            replaced_any = replaced_any or replaced
+            script_path.write_text(updated, encoding="utf-8")
+
+            latest_execution = run_pytest_single(repo_path, script_path.name)
+            _update_component_execution(models, case["component"], latest_execution)
+            _refresh_worker_rollups(models)
+            round_notes.append(
+                f"round {round_no}: {latest_execution.get('passed', 0)} passed, "
+                f"{latest_execution.get('failed', 0)} failed, {latest_execution.get('errors', 0)} errors"
+            )
+            if latest_execution.get("all_passed"):
+                break
+            last_failure = (latest_execution.get("output") or "")[-1800:] or last_failure
+
+        if latest_execution is None:
+            return "I couldn't generate a usable patch for that case right now."
+
+        verdict = "now passes" if latest_execution.get("all_passed") else "still fails"
+        return (
+            f"Updated {case['case_id']} ({target_name}) in {script_path.name} and re-ran pytest: "
+            f"{latest_execution.get('passed', 0)} passed, {latest_execution.get('failed', 0)} failed, "
+            f"{latest_execution.get('errors', 0)} errors ({verdict}). "
+            f"Attempts: {', '.join(round_notes)}."
+            + (" Function replaced." if replaced_any else " Function was appended because it was not found in the script.")
+        )
+
+    if case:
+        if client is None:
+            if case.get("status") in {"FAILED", "ERROR"}:
+                return f"{case['case_id']} failed because: {case.get('reason') or 'pytest reported a failure without a parsed reason.'}"
+            return f"{case['case_id']} checks {case.get('expected') or 'the expected behavior from the spec'} using `{case.get('test_name')}`."
+        prompt = (
+            "Explain this test case and (if failed) why it failed. Keep it concise and practical.\n"
+            f"Case: {case['case_id']}\n"
+            f"Test type: {case['test_type']}\n"
+            f"Component: {case['component']}\n"
+            f"Scenario ID: {case['scenario_id']}\n"
+            f"Scenario category: {case['category']}\n"
+            f"Inputs: {case['inputs']}\n"
+            f"Expected: {case['expected']}\n"
+            f"Status: {case['status']}\n"
+            f"Failure reason: {case['reason']}\n"
+            f"Test code:\n{case['code'][:3000]}\n"
+            f"User question:\n{user_text}\n"
+        )
+        response = client.chat(AGENTS["master"], prompt, max_tokens=500, temperature=0.2, timeout=90, retries=1)
+        if response.get("ok") and response.get("content"):
+            return str(response["content"]).strip()
+    return "Pick a case from the table, then ask naturally (for example: 'why it failed?' or 'fix this to match actual behavior')."
+
+
+def _render_results_ai_chat(cases: list, models: dict, repo_path: str) -> None:
+    """Floating-like AI helper for case-level explain/fix actions in Results view."""
+    st.markdown("""
+<style>
+.results-ai-chip {
+  border: 1px solid rgba(59,130,246,.35);
+  background: rgba(59,130,246,.10);
+  border-radius: 999px;
+  padding: .25rem .65rem;
+  font-size: .8rem;
+}
+</style>
+""", unsafe_allow_html=True)
+    state = st.session_state
+    state.setdefault("results_ai_messages", [
+        {"role": "assistant", "content": "I'm the Results AI helper. Mention a case like TC-0003 and ask why it failed, or say 'fix TC-0003 ...'."}
+    ])
+    state.setdefault("results_ai_pending_prompt", "")
+    state.setdefault("results_ai_pending_action", None)
+    case_index = {case["case_id"]: case for case in cases}
+    active_case_id = str(state.get("results_active_case_id") or "")
+
+    def ask_and_store(prompt_text: str) -> None:
+        state["results_ai_messages"].append({"role": "user", "content": prompt_text})
+        pending = state.get("results_ai_pending_action")
+        if pending:
+            if _is_affirmative(prompt_text):
+                run_prompt = str(pending.get("prompt") or "")
+                reply = _results_ai_reply(run_prompt, case_index, models, repo_path, active_case_id=active_case_id)
+                state["results_ai_pending_action"] = None
+                state["results_ai_messages"].append({"role": "assistant", "content": reply})
+                return
+            if _is_negative(prompt_text):
+                state["results_ai_pending_action"] = None
+                state["results_ai_messages"].append({
+                    "role": "assistant",
+                    "content": "Cancelled. Tell me when you want to run or fix this case."
+                })
+                return
+            state["results_ai_messages"].append({
+                "role": "assistant",
+                "content": "Please reply with yes or no for the pending run/fix action."
+            })
+            return
+
+        action_kind = _results_ai_action_kind(prompt_text)
+        if action_kind:
+            case = _case_from_prompt(prompt_text, case_index, active_case_id)
+            if not case:
+                state["results_ai_messages"].append({
+                    "role": "assistant",
+                    "content": "Pick a case in the table first, or mention one like TC-0003."
+                })
+                return
+            action_text = (
+                "apply AI fix + rerun the script (up to 3 repair rounds)"
+                if action_kind == "fix_rerun" else
+                "rerun this script"
+            )
+            state["results_ai_pending_action"] = {
+                "kind": action_kind,
+                "case_id": case["case_id"],
+                "prompt": prompt_text,
+            }
+            state["results_ai_messages"].append({
+                "role": "assistant",
+                "content": (
+                    f"Do you want me to {action_text} for {case['case_id']} "
+                    f"({case.get('test_type', 'test')} type) now? Reply yes or no."
+                )
+            })
+            return
+
+        reply = _results_ai_reply(prompt_text, case_index, models, repo_path, active_case_id=active_case_id)
+        state["results_ai_messages"].append({"role": "assistant", "content": reply})
+
+    with st.popover("💬 AI Test Assistant", use_container_width=False):
+        if active_case_id:
+            st.caption(f"Active case: {active_case_id}. You can ask directly, or mention another case ID.")
+        else:
+            st.caption("Pick a case in the table first, or mention one like TC-0002.")
+        st.markdown("<span class='results-ai-chip'>Explain</span> <span class='results-ai-chip'>Why failed</span> <span class='results-ai-chip'>Fix and rerun</span>", unsafe_allow_html=True)
+
+        pending_prompt = (state.get("results_ai_pending_prompt") or "").strip()
+        if pending_prompt:
+            with st.spinner("Thinking..."):
+                ask_and_store(pending_prompt)
+            state["results_ai_pending_prompt"] = ""
+            st.rerun()
+
+        for msg in state["results_ai_messages"][-8:]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+        prompt = st.chat_input("Ask about a case number...", key="results_ai_input")
+        if prompt:
+            with st.spinner("Thinking..."):
+                ask_and_store(prompt)
+            st.rerun()
+
+
+def _render_case_workbench(models: dict, repo_path: str) -> None:
+    """Case-first side-by-side view with numbering, type labels and targeted rerun."""
+    cases = _results_case_catalog(models)
+    if not cases:
+        st.info("No scenario-level cases found yet.")
+        return
+
+    table = [{
+        "Case": case["case_id"],
+        "Type": case["test_type"],
+        "Status": case["status"],
+        "Component": case["component"],
+        "Scenario": case["scenario_id"],
+        "Test": case["test_name"],
+    } for case in cases]
+    st.markdown("**Numbered test cases**")
+    st.dataframe(table, hide_index=True, width="stretch")
+
+    picked_id = st.selectbox("Select a case", [case["case_id"] for case in cases], key="results_case_pick")
+    st.session_state["results_active_case_id"] = picked_id
+    picked = next(case for case in cases if case["case_id"] == picked_id)
+    description = (
+        f"Type: {picked['test_type']}\n\n"
+        f"Component: `{picked['component']}`\n\n"
+        f"Scenario: {picked['scenario_id'] or '-'} {picked['category'] or ''}\n\n"
+        f"Inputs: {picked['inputs'] or '-'}\n\n"
+        f"Expected: {picked['expected'] or '-'}\n\n"
+        f"Evidence: {picked['evidence'] or '-'}"
+    )
+    left, middle, right = st.columns([3, 4, 3])
+    left.markdown("**Description**")
+    left.markdown(description)
+    middle.markdown("**Script**")
+    middle.code(picked.get("code") or "# test function not found in script", language="python")
+    right.markdown("**Result**")
+    badge = "✅" if picked["status"] == "PASSED" else ("❌" if picked["status"] in {"FAILED", "ERROR"} else "⚪")
+    right.markdown(f"{badge} **{picked['status']}**")
+    if picked.get("reason"):
+        right.code(picked["reason"], language="text")
+
+    actions = st.columns([1, 3])
+    if actions[0].button("Run this script", key=f"rerun_case_{picked_id}", use_container_width=True):
+        if picked.get("script"):
+            script_path = _resolve_case_script_path(repo_path, str(picked.get("script") or ""))
+            if script_path is None:
+                st.warning(
+                    "No runnable script file found for this case yet. Re-run generation for this component first."
+                )
+            else:
+                execution = run_pytest_single(repo_path, script_path.name)
+                _update_component_execution(models, picked["component"], execution)
+                _refresh_worker_rollups(models)
+                st.success(
+                    f"Re-ran {script_path.name}: {execution.get('passed', 0)} passed, "
+                    f"{execution.get('failed', 0)} failed, {execution.get('errors', 0)} errors."
+                )
+                st.rerun()
+        else:
+            st.warning("No script path recorded for this case.")
+    actions[1].caption(
+        f"Use 💬 AI Test Assistant and ask: Explain {picked_id} or Fix {picked_id}."
+    )
+
+    _render_results_ai_chat(cases, models, repo_path)
+
+
 def _render_coverage_gaps(coverage: dict, repo_path: str) -> None:
     """Uncovered source lines per component, with an action that writes tests for them."""
     if not coverage or coverage.get("error"):
@@ -5001,7 +5883,10 @@ def _results_content() -> None:
     if run_state.get("active"):
         return
     _render_export_menu(repo_path)
-    sbs, gaps, history, report = st.tabs(["Side by side", "Coverage gaps", "History", "Report"])
+    workbench, sbs, gaps, history, report = st.tabs(
+        ["Case workbench", "Side by side", "Coverage gaps", "History", "Report"])
+    with workbench:
+        _render_case_workbench(models, repo_path)
     with sbs:
         _render_side_by_side(models)
     with gaps:
@@ -5037,7 +5922,10 @@ def render_results_page() -> None:
 def render_chat_workspace() -> None:
     """Free-text chat front end for the VIO pipeline."""
     state = st.session_state
-    state.setdefault("chat_messages", [{"role": "assistant", "content": CHAT_GREETING}])
+    state.setdefault("chat_messages", [])
+    if len(state["chat_messages"]) == 1 and "Share the GitHub repository link and the type of tests you need" in \
+            str(state["chat_messages"][0].get("content", "")):
+        state["chat_messages"] = []
     state.setdefault("chat_request", chat_assistant.new_request())
     state.setdefault("chat_stage", "intake")
 
@@ -5057,8 +5945,6 @@ def render_chat_workspace() -> None:
             render_coverage_panel(state.get("last_coverage"))
         _render_export_menu(state.get("repository_path", ""))
 
-    _render_chat_options(st.empty())
-
     text = st.chat_input("Type your message…")
     if text:
         state["chat_messages"].append({"role": "user", "content": text})
@@ -5070,8 +5956,8 @@ def render_chat_workspace() -> None:
         state["chat_messages"].append({"role": "assistant", "content": reply})
         st.rerun()
 
-    if len(state["chat_messages"]) > 1 and st.button("New conversation", key="chat_clear"):
-        state.update(chat_messages=[{"role": "assistant", "content": CHAT_GREETING}],
+    if len(state["chat_messages"]) > 0 and st.button("New conversation", key="chat_clear"):
+        state.update(chat_messages=[],
                      chat_request=chat_assistant.new_request(), chat_stage="intake")
         st.rerun()
 
@@ -5107,19 +5993,14 @@ def main() -> None:
 
     render_top_bar()
 
-    # Chat and VIO classic return early; Ollama classic continues with the existing flow below
-    view = st.radio("View", [VIEW_CHAT, VIEW_RESULTS, VIEW_ADVANCED], horizontal=True,
+    # Chat and results return early; Ollama workspace continues with the existing flow below
+    view = st.radio("View", [VIEW_CHAT, VIEW_RESULTS], horizontal=True,
                     key="app_view", label_visibility="collapsed")
     if view == VIEW_CHAT:
         render_chat_workspace()
         return
     if view == VIEW_RESULTS:
         render_results_page()
-        return
-    advanced = st.radio("Advanced workspace", ["🛠️ Classic VIO", "🖥️ Classic Ollama"], horizontal=True,
-                        key="app_advanced")
-    if advanced == "🛠️ Classic VIO":
-        render_vio_workspace()
         return
 
     # ── Ollama workspace (existing flow, unchanged) ──

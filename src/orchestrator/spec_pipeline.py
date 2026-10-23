@@ -414,10 +414,47 @@ def spec_slugs(repo_path):
     return {path.stem.split("_", 1)[1] for path in specs.glob("*.md") if "_" in path.stem}
 
 
-def select_components(repo_path, components, resume=False):
-    """Queue of meaningful components still to specify; `resume` skips those that already have a spec."""
+def _typed_spec_slugs(repo_path, required_types):
+    """Components whose saved scenarios already cover all required test types."""
+    required = {str(t) for t in (required_types or []) if t}
+    if not required:
+        return spec_slugs(repo_path)
+
+    state_path = Path(repo_path) / "tests" / "vio_run_state.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return spec_slugs(repo_path)
+
+    covered_by_component = {}
+    fallback_types = {str(t) for t in (state.get("types") or []) if t}
+    for item in state.get("results") or []:
+        component = str(item.get("component") or "")
+        if not component:
+            continue
+        plan = item.get("plan") or {}
+        scenarios = plan.get("scenarios") or []
+        found = {
+            str(scenario.get("test_type"))
+            for scenario in scenarios
+            if isinstance(scenario, dict) and scenario.get("test_type")
+        }
+        if not found and fallback_types:
+            found = set(fallback_types)
+        if found:
+            covered_by_component.setdefault(component, set()).update(found)
+
+    return {
+        component.replace(".", "_")
+        for component, covered in covered_by_component.items()
+        if required.issubset(covered)
+    }
+
+
+def select_components(repo_path, components, resume=False, required_types=None):
+    """Queue of meaningful components still to specify; `resume` skips already covered ones."""
     meaningful, excluded = classify_components(components)
-    done = spec_slugs(repo_path) if resume else set()
+    done = _typed_spec_slugs(repo_path, required_types) if resume else set()
     pending = [item for item in meaningful
                if (item["module"] + "." + item["symbol"]).replace(".", "_") not in done]
     return {"pending": pending, "meaningful": len(meaningful),
@@ -910,6 +947,24 @@ def merge_test_chunks(chunks, replace_names=()):
                     helpers.setdefault(key, (node, rendered))
             elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
                 continue
+            elif isinstance(node, ast.If):
+                # Ignore common model-added runner guards; they are not needed for pytest modules.
+                test = node.test
+                is_main_guard = (
+                    isinstance(test, ast.Compare)
+                    and isinstance(test.left, ast.Name)
+                    and test.left.id == "__name__"
+                    and len(test.ops) == 1
+                    and isinstance(test.ops[0], ast.Eq)
+                    and len(test.comparators) == 1
+                    and isinstance(test.comparators[0], ast.Constant)
+                    and test.comparators[0].value == "__main__"
+                )
+                if is_main_guard:
+                    continue
+                raise ValueError(
+                    f"Generated chunk has unsupported module-level code: {type(node).__name__}"
+                )
             else:
                 raise ValueError(
                     f"Generated chunk has unsupported module-level code: {type(node).__name__}"
@@ -1370,37 +1425,34 @@ def check_alignment(code, plan, component):
 
 
 def generate_valid_code(client, model, prompt, extract_code, options, attempts=None):
-    """Generate Python and retry once if the model returns invalid syntax."""
-    output, metrics = client.generate(model, prompt, options=options)
-    _record_generation_attempt(attempts, model, prompt, output)
-    log_generation_metrics(metrics, "test generation")
-    code = extract_code(output)
-
-    try:
-        ast.parse(code)
-    except SyntaxError as syntax_error:
-        repair_prompt = (
-            prompt
-            + "\nThe previous response was not valid Python. Return a complete corrected "
-            "pytest file. Do not assign to a function call; use a variable assignment "
-            "or an equality assertion as appropriate.\n"
-            f"Parser error: {syntax_error.msg} at line {syntax_error.lineno}.\n"
-            f"INVALID PYTHON:\n{code}"
-        )
-        output, metrics = client.generate(model, repair_prompt, options=options)
-        _record_generation_attempt(attempts, model, repair_prompt, output)
-        log_generation_metrics(metrics, "syntax repair")
+    """Generate Python and retry up to two times if the model returns invalid syntax."""
+    current_prompt = prompt
+    attempts_left = 2
+    phase = "test generation"
+    while True:
+        output, metrics = client.generate(model, current_prompt, options=options)
+        _record_generation_attempt(attempts, model, current_prompt, output)
+        log_generation_metrics(metrics, phase)
         code = extract_code(output)
-
         try:
             ast.parse(code)
-        except SyntaxError as repair_error:
-            raise ValueError(
-                "Model returned invalid Python after one syntax-repair attempt: "
-                f"{repair_error.msg} at line {repair_error.lineno}"
-            ) from repair_error
-
-    return code
+            return code
+        except SyntaxError as syntax_error:
+            if attempts_left == 0:
+                raise ValueError(
+                    "Model returned invalid Python after syntax-repair attempts: "
+                    f"{syntax_error.msg} at line {syntax_error.lineno}"
+                ) from syntax_error
+            current_prompt = (
+                prompt
+                + "\nThe previous response was not valid Python. Return a complete corrected "
+                "pytest file. Do not assign to a function call; use a variable assignment "
+                "or an equality assertion as appropriate.\n"
+                f"Parser error: {syntax_error.msg} at line {syntax_error.lineno}.\n"
+                f"INVALID PYTHON:\n{code}"
+            )
+            attempts_left -= 1
+            phase = "syntax repair"
 
 
 def generate_aligned_code(client, model, prompt, extract_code, options, plan, component, attempts=None):
@@ -1463,7 +1515,32 @@ def _aligned_code(client, model, prompt, extract_code, options, plan, component,
             f"{validation_error}\nINVALID TEST FILE:\n{code}"
         )
         code = generate_valid_code(client, model, repair_prompt, extract_code, options, attempts)
-        check_alignment(code, plan, component)
+        code = remove_unplanned_tests(code, plan)
+        try:
+            check_alignment(code, plan, component)
+        except ValueError as second_error:
+            targeted_hint = ""
+            text = str(second_error)
+            if "no behavioral assertion" in text:
+                targeted_hint = (
+                    "For every test, add at least one behavioral assertion about return value, raised exception, "
+                    "or observable state mutation. Avoid placeholder assertions like assert True.\n"
+                )
+            elif "never exercises" in text:
+                targeted_hint = (
+                    "Each test must call or directly inspect the imported target symbol under test; do not only "
+                    "set up fixtures without exercising the target.\n"
+                )
+            second_repair_prompt = (
+                prompt
+                + "\nThe previous correction still failed quality checks. Produce a final corrected test file "
+                "that keeps all planned test names and satisfies strict alignment checks.\n"
+                + targeted_hint
+                + f"Validation error: {second_error}\nPREVIOUS TEST FILE:\n{code}"
+            )
+            code = generate_valid_code(client, model, second_repair_prompt, extract_code, options, attempts)
+            code = remove_unplanned_tests(code, plan)
+            check_alignment(code, plan, component)
     return code
 
 
@@ -1517,6 +1594,19 @@ def coverage_env(repo_path):
     roots = import_roots(repo_path)
     env["PYTHONPATH"] = os.pathsep.join([*roots, *filter(None, [env.get("PYTHONPATH")])])
     return env
+
+
+def repo_python(repo_path):
+    """Interpreter for repository-bound test operations; prefer repo .venv, else current Python."""
+    repo = Path(repo_path)
+    candidates = (
+        repo / ".venv" / "Scripts" / "python.exe",  # Windows
+        repo / ".venv" / "bin" / "python",          # POSIX
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
 
 
 def _symbol_span(path, symbol):
@@ -1621,13 +1711,18 @@ def measure_coverage(repo_path, components, timeout=900, results=None):
     directory.mkdir(parents=True, exist_ok=True)
     json_path = directory / "coverage.json"
     json_path.unlink(missing_ok=True)
-    targets, deselect = [str(scripts)], []
+    all_scripts = sorted(str(path) for path in scripts.glob("*_test.py"))
+    targets, deselect = (all_scripts or [str(scripts)]), []
+    passing_only = results is not None
     if results is not None:
         targets, deselect = passing_selection(results, scripts)
         if not targets:
-            return {"error": "no generated test passes yet, so there is nothing to measure"}
+            # Some runs don't persist per-test pass counts; keep coverage useful by
+            # measuring all generated scripts instead of failing early.
+            targets, deselect = (all_scripts or [str(scripts)]), []
+            passing_only = False
     command = [
-        sys.executable, "-m", "pytest", *targets, "-c", str(scripts / "pytest.ini"),
+        repo_python(repo_path), "-m", "pytest", *targets, "-c", str(scripts / "pytest.ini"),
         "--rootdir", str(scripts), f"--confcutdir={scripts}", "-p", "no:cacheprovider", "-q",
         *(f"--deselect={test}" for test in deselect),
         *coverage_options(components, json_path),
@@ -1638,15 +1733,78 @@ def measure_coverage(repo_path, components, timeout=900, results=None):
     except (subprocess.TimeoutExpired, OSError) as exc:
         return {"error": f"coverage run did not complete: {exc}"}
     output = (proc.stdout or "") + (proc.stderr or "")
+    if not json_path.is_file() and results is not None and targets != (all_scripts or [str(scripts)]):
+        # If selection of only passing scripts produced no report, retry on all generated scripts.
+        fallback = [
+            repo_python(repo_path), "-m", "pytest", *(all_scripts or [str(scripts)]), "-c", str(scripts / "pytest.ini"),
+            "--rootdir", str(scripts), f"--confcutdir={scripts}", "-p", "no:cacheprovider", "-q",
+            *coverage_options(components, json_path),
+        ]
+        try:
+            proc2 = subprocess.run(fallback, capture_output=True, text=True, timeout=timeout, cwd=str(scripts),
+                                   env=coverage_env(repo_path))
+            output += "\n\n--- coverage fallback run ---\n" + (proc2.stdout or "") + (proc2.stderr or "")
+        except (subprocess.TimeoutExpired, OSError):
+            pass
     if not json_path.is_file():
-        reason = "pytest-cov is not installed (pip install pytest-cov)" \
-            if "unrecognized arguments" in output else "pytest produced no coverage data"
-        return {"error": reason, "output": output[-2000:]}
+        # Salvage mode: run each target script separately with coverage append so one
+        # crashing script cannot block coverage for every other passing script.
+        packages = sorted({item["module"].split(".")[0] for item in components})
+        cov_data = scripts / ".coverage"
+        cov_data.unlink(missing_ok=True)
+        ran = 0
+        salvage_log = []
+        for index, target in enumerate(targets):
+            per_script = [
+                repo_python(repo_path), "-m", "pytest", target, "-c", str(scripts / "pytest.ini"),
+                "--rootdir", str(scripts), f"--confcutdir={scripts}", "-p", "no:cacheprovider", "-q",
+                *(f"--deselect={test}" for test in deselect if Path(test.split("::", 1)[0]).name == Path(target).name),
+                *(f"--cov={name}" for name in packages), "--cov-branch", "--cov-report=",
+            ]
+            if index > 0:
+                per_script.append("--cov-append")
+            try:
+                per = subprocess.run(
+                    per_script,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=str(scripts),
+                    env=coverage_env(repo_path),
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                salvage_log.append(f"{Path(target).name}: {exc}")
+                continue
+            ran += 1
+            per_out = ((per.stdout or "") + (per.stderr or "")).strip()
+            if "INTERNALERROR" in per_out:
+                salvage_log.append(f"{Path(target).name}: INTERNALERROR")
+
+        if cov_data.is_file() and ran:
+            try:
+                to_json = subprocess.run(
+                    [repo_python(repo_path), "-m", "coverage", "json", "-o", str(json_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=str(scripts),
+                    env=coverage_env(repo_path),
+                )
+                if to_json.returncode != 0:
+                    salvage_log.append(((to_json.stdout or "") + (to_json.stderr or "")).strip())
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                salvage_log.append(f"coverage json export failed: {exc}")
+
+        if not json_path.is_file():
+            reason = "pytest-cov is not installed (pip install pytest-cov)" \
+                if "unrecognized arguments" in output else "pytest produced no coverage data"
+            extra = "\n".join([line for line in salvage_log if line])
+            return {"error": reason, "output": (output + ("\n\n--- salvage ---\n" + extra if extra else ""))[-2000:]}
     try:
         coverage = summarize_coverage(repo_path, components, json_path, scripts)
     except (OSError, ValueError, KeyError) as exc:
         return {"error": f"could not read coverage data: {exc}"}
-    coverage["passing_only"] = results is not None
+    coverage["passing_only"] = passing_only
     (directory / "coverage_summary.md").write_text(render_coverage_markdown(coverage), encoding="utf-8")
     return coverage
 
@@ -1669,7 +1827,8 @@ def check_imports(repo_path, modules, timeout=300):
     """Import modules in a fresh interpreter; returns {module: error} for the ones that fail."""
     try:
         proc = subprocess.run(
-            [sys.executable, "-c", _IMPORT_PROBE, json.dumps(import_roots(repo_path)), json.dumps(sorted(modules))],
+            [repo_python(repo_path), "-c", _IMPORT_PROBE,
+             json.dumps(import_roots(repo_path)), json.dumps(sorted(modules))],
             capture_output=True, text=True, timeout=timeout, cwd=str(repo_path),
         )
     except (subprocess.TimeoutExpired, OSError):
@@ -1702,7 +1861,7 @@ def install_declared_dependencies(repo_path):
         return False
     try:
         proc = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q", *args],
+            [repo_python(repo_path), "-m", "pip", "install", "-q", *args],
             capture_output=True, text=True, timeout=900, cwd=str(repo_path),
         )
     except (subprocess.TimeoutExpired, OSError):
@@ -1956,7 +2115,7 @@ def rerun_component(repo, component, previous, test_types, plan_client, plan_mod
                 execution, code = _repair_rounds(
                     repo, component, plan, spec, script, header, code, execution, (writer_client, writer_model),
                     extract_code, run_tests, [], result, RERUN_REPAIR_ROUNDS, guidance,
-                    include_task_guidance=engine == "vio",
+                    include_task_guidance=engine == "ollama",
                 )
         _record_outcome(result, repo / "tests" / "orchestration_results", spec, script, plan, execution, code,
                         identity, component)
@@ -1997,7 +2156,7 @@ def process_component(repo, component, test_types, plan_client, plan_model, extr
     try:
         if len(component["source"]) > MAX_SOURCE_CHARS:
             component = {**component, "source": _truncate(component["source"], MAX_SOURCE_CHARS)}
-        base_prompt = prompt = plan_prompt(component, test_types, include_task_guidance=engine == "vio")
+        base_prompt = prompt = plan_prompt(component, test_types, include_task_guidance=engine == "ollama")
         plan_component, plan_tokens, compact = component, PLAN_MAX_OUTPUT_TOKENS, False
         rounds, attempt = PLAN_ATTEMPTS, 0
         while True:
@@ -2016,7 +2175,7 @@ def process_component(repo, component, test_types, plan_client, plan_model, extr
                 compact, rounds, plan_tokens = True, rounds + 1, COMPACT_PLAN_TOKENS
                 plan_component = {**component, "source": _truncate(component["source"], COMPACT_SOURCE_CHARS)}
                 base_prompt = prompt = plan_prompt(
-                    plan_component, test_types, compact=True, include_task_guidance=engine == "vio",
+                    plan_component, test_types, compact=True, include_task_guidance=engine == "ollama",
                 )
                 continue
             _record_generation_attempt(attempts, plan_model, prompt, text)
@@ -2052,7 +2211,7 @@ def process_component(repo, component, test_types, plan_client, plan_model, extr
         entering("script")
         code, chunk_count, prompts = generate_chunked_script(
             writer_client, writer_model, component, plan, spec, extract_code, attempts,
-            include_task_guidance=engine == "vio",
+            include_task_guidance=engine == "ollama",
         )
         result["chunk_count"] = chunk_count
         result["prompt"] = "\n\n--- scenario batch ---\n\n".join(prompts)
@@ -2072,7 +2231,7 @@ def process_component(repo, component, test_types, plan_client, plan_model, extr
         execution, code = _repair_rounds(
             repo, component, plan, spec, script, header, code, execution, (writer_client, writer_model),
             extract_code, run_tests, attempts, result, REPAIR_ROUNDS,
-            include_task_guidance=engine == "vio",
+            include_task_guidance=engine == "ollama",
         )
         mark("repair")
         _record_outcome(result, directory, spec, script, plan, execution, code, identity, component)
@@ -2202,7 +2361,7 @@ def top_up_component(repo, component, row, previous, test_types, plan_client, pl
         return {**previous, "topup": reason}
 
     try:
-        prompt = plan_prompt(focused, test_types, include_task_guidance=engine == "vio")
+        prompt = plan_prompt(focused, test_types, include_task_guidance=engine == "ollama")
         prompt += "\nExisting test names, do not reuse: " + json.dumps([s["name"] for s in plan["scenarios"]]) + "\n"
         text, _metrics = plan_client.generate(plan_model, prompt, format="json",
                                               options=generation_options(prompt, PLAN_MAX_OUTPUT_TOKENS))
@@ -2214,7 +2373,7 @@ def top_up_component(repo, component, row, previous, test_types, plan_client, pl
         writer_client, writer_model, _label = choose_writer(extra) if choose_writer else (plan_client, plan_model, "")
         new_code, _chunks, _prompts = generate_chunked_script(
             writer_client, writer_model, focused, extra, spec, extract_code,
-            include_task_guidance=engine == "vio")
+            include_task_guidance=engine == "ollama")
         code = merge_test_chunks([code, new_code])
         check_alignment(code, merged, component)
         _respec(spec, repo, component, merged, previous.get("engine", engine), previous.get("writer", ""))
@@ -2223,7 +2382,7 @@ def top_up_component(repo, component, row, previous, test_types, plan_client, pl
         _passed_cleanly(execution)
         execution, code = _repair_rounds(
             repo, focused, merged, spec, script, header, code, execution, (writer_client, writer_model),
-            extract_code, run_tests, [], result, REPAIR_ROUNDS, include_task_guidance=engine == "vio")
+            extract_code, run_tests, [], result, REPAIR_ROUNDS, include_task_guidance=engine == "ollama")
         new_names = {scenario["name"] for scenario in extra["scenarios"]}
         failed = _failed_test_names(execution.get("output", ""))
         if not execution.get("all_passed") and failed and failed <= new_names and failed != new_names:
