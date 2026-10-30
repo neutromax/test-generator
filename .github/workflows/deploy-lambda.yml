@@ -1,0 +1,75 @@
+name: Deploy to AWS Lambda
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: test-generator
+  LAMBDA_FUNCTION_NAME: test-generator-app
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Update Lambda function code
+        run: |
+          aws lambda update-function-code \
+            --function-name $LAMBDA_FUNCTION_NAME \
+            --image-uri ${{ steps.image.outputs.image }} \
+            --region $AWS_REGION
+
+      - name: Wait for function update
+        run: sleep 10
+
+      - name: Get function URL
+        id: function-url
+        run: |
+          FUNCTION_URL=$(aws lambda get-function-url-config \
+            --function-name $LAMBDA_FUNCTION_NAME \
+            --query 'FunctionUrl' \
+            --output text \
+            --region $AWS_REGION 2>/dev/null || echo "URL not configured")
+          echo "url=$FUNCTION_URL" >> $GITHUB_OUTPUT
+
+      - name: Test endpoint
+        if: steps.function-url.outputs.url != 'URL not configured'
+        run: |
+          curl -I --max-time 30 ${{ steps.function-url.outputs.url }} || echo "Function warming up..."
+
+      - name: Deployment Summary
+        run: |
+          echo "✅ Deployment Complete!"
+          echo "Function: $LAMBDA_FUNCTION_NAME"
+          echo "Region: $AWS_REGION"
+          echo "Image: ${{ steps.image.outputs.image }}"
+          echo "Deployed at: $(date -u)"
